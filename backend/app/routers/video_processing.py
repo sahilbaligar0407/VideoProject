@@ -1,0 +1,367 @@
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Form
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.requests import Request
+import os
+import uuid
+import aiofiles
+import subprocess
+from typing import Optional
+import asyncio
+from app.services.video_processor import VideoProcessor
+from app.models import VideoProcessingResponse, ProcessingStatus
+from app.config import settings
+import json
+
+router = APIRouter()
+
+# In-memory storage for processing status (in production, use Redis or database)
+processing_status = {}
+
+@router.post("/process-video")
+async def process_video(
+    background_tasks: BackgroundTasks,
+    youtube_url: Optional[str] = Form(None),
+    video_file: Optional[UploadFile] = File(None),
+    add_captions: Optional[str] = Form("true")
+):
+    """Process video from either YouTube URL or file upload"""
+    
+    # Debug logging
+    print(f"🔍 Received request:")
+    print(f"  YouTube URL: {youtube_url}")
+    print(f"  Video file: {video_file.filename if video_file else 'None'}")
+    print(f"  File size: {video_file.size if video_file else 'N/A'}")
+    
+    if not youtube_url and not video_file:
+        raise HTTPException(status_code=400, detail="Either YouTube URL or video file must be provided")
+    
+    if youtube_url and video_file:
+        raise HTTPException(status_code=400, detail="Provide either YouTube URL OR video file, not both")
+    
+    # Generate request ID
+    request_id = str(uuid.uuid4())
+    
+    # Initialize processing status
+    processing_status[request_id] = {
+        "status": "processing",
+        "progress": 0,
+        "message": "Starting video processing...",
+        "current_step": "initializing",
+        "clips": None,
+        "error": None
+    }
+    
+    # Start background processing
+    if youtube_url:
+        print(f"🚀 Starting YouTube processing for request: {request_id}")
+        background_tasks.add_task(process_youtube_video, request_id, youtube_url, add_captions)
+    else:
+        print(f"🚀 Starting file upload processing for request: {request_id}")
+        background_tasks.add_task(process_uploaded_video, request_id, video_file, add_captions)
+    
+    return {
+        "request_id": request_id,
+        "status": "processing",
+        "message": "Video processing started"
+    }
+
+@router.get("/status/{request_id}")
+async def get_processing_status(request_id: str):
+    """Get the current processing status for a request"""
+    if request_id not in processing_status:
+        raise HTTPException(status_code=404, detail="Request not found")
+    
+    return processing_status[request_id]
+
+@router.options("/download/{clip_id}")
+async def download_clip_options(clip_id: str):
+    """Handle CORS preflight request for download endpoint"""
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+@router.get("/download/{clip_id}")
+async def download_clip(clip_id: str):
+    """Download a generated clip"""
+    print(f"🔍 Download request for clip_id: {clip_id}")
+    
+    # Find the clip in processing status
+    clip_path = None
+    for status in processing_status.values():
+        if status.get("clips"):
+            for clip in status["clips"]:
+                if clip["clip_id"] == clip_id:
+                    clip_path = clip["file_path"]
+                    print(f"📁 Found clip in status: {clip}")
+                    break
+            if clip_path:
+                break
+    
+    if not clip_path:
+        print(f"❌ Clip {clip_id} not found in processing status")
+        raise HTTPException(status_code=404, detail="Clip not found")
+    
+    # Debug: print what we found
+    print(f"🔍 Looking for clip {clip_id}")
+    print(f"📁 Found clip path: {clip_path}")
+    print(f"📂 File exists: {os.path.exists(clip_path) if clip_path else 'No path'}")
+    
+    if not os.path.exists(clip_path):
+        # Try to find the file in the outputs directory
+        from app.config import settings
+        output_dir = settings.output_dir
+        print(f"Searching in output directory: {output_dir}")
+        
+        # List all files in output directory
+        if os.path.exists(output_dir):
+            files = os.listdir(output_dir)
+            print(f"Files in output directory: {files}")
+            
+            # Look for files that might contain the clip_id
+            for filename in files:
+                if clip_id in filename:
+                    clip_path = os.path.join(output_dir, filename)
+                    print(f"Found matching file: {clip_path}")
+                    break
+        
+        if not clip_path or not os.path.exists(clip_path):
+            raise HTTPException(status_code=404, detail="Clip file not found on disk")
+    
+    # Add CORS headers for frontend access
+    response = FileResponse(
+        clip_path,
+        media_type="video/mp4",
+        filename=f"clip_{clip_id}.mp4"
+    )
+    
+    # Add CORS headers
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    
+    print(f"✅ Returning file response for {clip_path}")
+    return response
+
+async def process_youtube_video(request_id: str, youtube_url: str, add_captions: str):
+    """Process YouTube video with actual download and processing"""
+    try:
+        # Update status
+        processing_status[request_id]["current_step"] = "downloading_youtube"
+        processing_status[request_id]["message"] = "Downloading YouTube video..."
+        processing_status[request_id]["progress"] = 10
+        
+        # Download YouTube video using yt-dlp
+        video_path = await download_youtube_video(request_id, youtube_url)
+        
+        # Update status
+        processing_status[request_id]["current_step"] = "processing_video"
+        processing_status[request_id]["message"] = "Processing downloaded video..."
+        processing_status[request_id]["progress"] = 30
+        
+        # Process the downloaded video
+        processor = VideoProcessor()
+        clips = await processor.process_video(video_path, "youtube", add_captions.lower() == "true")
+        
+        print(f"Generated {len(clips)} clips from YouTube video")
+        
+        # Convert clips to dict for JSON serialization
+        clips_dict = []
+        for clip in clips:
+            clip_dict = {
+                "clip_id": clip.clip_id,
+                "start_time": clip.start_time,
+                "end_time": clip.end_time,
+                "duration": clip.duration,
+                "file_path": clip.file_path,
+                "caption_text": clip.caption_text,
+                "download_url": clip.download_url
+            }
+            clips_dict.append(clip_dict)
+            print(f"Clip {clip.clip_id}: {clip.file_path}")
+            print(f"  File exists: {os.path.exists(clip.file_path)}")
+            if os.path.exists(clip.file_path):
+                print(f"  File size: {os.path.getsize(clip.file_path)} bytes")
+        
+        # Update final status
+        processing_status[request_id]["status"] = "completed"
+        processing_status[request_id]["progress"] = 100
+        processing_status[request_id]["message"] = "YouTube video processing completed successfully!"
+        processing_status[request_id]["current_step"] = "completed"
+        processing_status[request_id]["clips"] = clips_dict
+        
+        print(f"Final clips in status: {clips_dict}")
+        
+        # Cleanup downloaded video
+        try:
+            os.remove(video_path)
+        except:
+            pass
+            
+    except Exception as e:
+        processing_status[request_id]["status"] = "failed"
+        processing_status[request_id]["error"] = str(e)
+        processing_status[request_id]["message"] = f"Processing failed: {str(e)}"
+        print(f"❌ YouTube processing failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+async def download_youtube_video(request_id: str, youtube_url: str) -> str:
+    """Download YouTube video using yt-dlp"""
+    try:
+        # Create download path
+        video_path = os.path.join(settings.upload_dir, f"{request_id}_youtube_video.mp4")
+        
+        # Use yt-dlp to download video
+        cmd = [
+            "yt-dlp",
+            "-f", "best[height<=720]",  # Download 720p or lower for faster processing
+            "-o", video_path,
+            youtube_url
+        ]
+        
+        print(f"📥 Downloading YouTube video: {youtube_url}")
+        print(f"📁 Save path: {video_path}")
+        print(f"🔧 Command: {' '.join(cmd)}")
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise Exception(f"YouTube download failed: {result.stderr}")
+        
+        if not os.path.exists(video_path):
+            raise Exception("Video file was not downloaded")
+        
+        file_size = os.path.getsize(video_path)
+        print(f"✅ YouTube video downloaded: {file_size} bytes")
+        
+        return video_path
+        
+    except Exception as e:
+        print(f"❌ YouTube download failed: {e}")
+        raise Exception(f"YouTube download failed: {str(e)}")
+
+async def process_uploaded_video(request_id: str, video_file: UploadFile, add_captions: str):
+    """Process uploaded video file"""
+    try:
+        # Update status
+        processing_status[request_id]["current_step"] = "saving_file"
+        processing_status[request_id]["message"] = "Saving uploaded video..."
+        processing_status[request_id]["progress"] = 10
+        
+        # Validate file type
+        file_extension = os.path.splitext(video_file.filename)[1].lower()
+        if file_extension not in settings.supported_formats:
+            raise Exception(f"Unsupported file format: {file_extension}")
+        
+        # Save uploaded file
+        video_path = os.path.join(settings.upload_dir, f"{request_id}_{video_file.filename}")
+        print(f"💾 Saving uploaded file to: {video_path}")
+        print(f"📁 Upload directory exists: {os.path.exists(settings.upload_dir)}")
+        print(f"📄 File name: {video_file.filename}")
+        print(f"📏 File size: {video_file.size} bytes")
+        
+        async with aiofiles.open(video_path, 'wb') as f:
+            content = await video_file.read()
+            await f.write(content)
+        
+        # Verify file was saved
+        if os.path.exists(video_path):
+            actual_size = os.path.getsize(video_path)
+            print(f"✅ File saved successfully: {actual_size} bytes")
+        else:
+            raise Exception(f"File was not saved to {video_path}")
+        
+        # Update status
+        processing_status[request_id]["current_step"] = "processing_video"
+        processing_status[request_id]["message"] = "Processing video..."
+        processing_status[request_id]["progress"] = 20
+        
+        # Process the video
+        processor = VideoProcessor()
+        clips = await processor.process_video(video_path, "file", add_captions.lower() == "true")
+        
+        print(f"Generated {len(clips)} clips")
+        
+        # Convert clips to dict for JSON serialization
+        clips_dict = []
+        for clip in clips:
+            clip_dict = {
+                "clip_id": clip.clip_id,
+                "start_time": clip.start_time,
+                "end_time": clip.end_time,
+                "duration": clip.duration,
+                "file_path": clip.file_path,
+                "caption_text": clip.caption_text,
+                "download_url": clip.download_url
+            }
+            clips_dict.append(clip_dict)
+            print(f"Clip {clip.clip_id}: {clip.file_path}")
+            print(f"  File exists: {os.path.exists(clip.file_path)}")
+            if os.path.exists(clip.file_path):
+                print(f"  File size: {os.path.getsize(clip.file_path)} bytes")
+        
+        # Update final status
+        processing_status[request_id]["status"] = "completed"
+        processing_status[request_id]["progress"] = 100
+        processing_status[request_id]["message"] = "Video processing completed successfully!"
+        processing_status[request_id]["current_step"] = "completed"
+        processing_status[request_id]["clips"] = clips_dict
+        
+        print(f"Final clips in status: {clips_dict}")
+        
+        # Cleanup uploaded file
+        try:
+            os.remove(video_path)
+        except:
+            pass
+            
+    except Exception as e:
+        processing_status[request_id]["status"] = "failed"
+        processing_status[request_id]["error"] = str(e)
+        processing_status[request_id]["message"] = f"Processing failed: {str(e)}"
+
+async def simulate_processing_steps(request_id: str, input_type: str):
+    """Simulate processing steps for YouTube videos (placeholder)"""
+    steps = [
+        ("transcribing", "Transcribing audio...", 30),
+        ("detecting_highlights", "Detecting highlight segments...", 50),
+        ("generating_clips", "Generating highlight clips...", 70),
+        ("adding_captions", "Adding captions to clips...", 90),
+        ("completed", "Processing completed!", 100)
+    ]
+    
+    for step, message, progress in steps:
+        processing_status[request_id]["current_step"] = step
+        processing_status[request_id]["message"] = message
+        processing_status[request_id]["progress"] = progress
+        await asyncio.sleep(1)
+    
+    # For YouTube, we'll create placeholder clips
+    placeholder_clips = [
+        {
+            "clip_id": str(uuid.uuid4()),
+            "start_time": 0,
+            "end_time": 30,
+            "duration": 30,
+            "file_path": "placeholder_clip_1.mp4",
+            "caption_text": "YouTube video highlight clip 1",
+            "download_url": f"/api/v1/download/{uuid.uuid4()}"
+        },
+        {
+            "clip_id": str(uuid.uuid4()),
+            "start_time": 60,
+            "end_time": 90,
+            "duration": 30,
+            "file_path": "placeholder_clip_2.mp4",
+            "caption_text": "YouTube video highlight clip 2",
+            "download_url": f"/api/v1/download/{uuid.uuid4()}"
+        }
+    ]
+    
+    processing_status[request_id]["clips"] = placeholder_clips
+    processing_status[request_id]["status"] = "completed"
