@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     # Whisper API Configuration
     whisper_model: str = "whisper-1"
     
+    # Viral Similarity Engine Configuration
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    viral_window_sec: float = float(os.getenv("VIRAL_WINDOW_SEC", "16"))
+    viral_window_hop: float = float(os.getenv("VIRAL_WINDOW_HOP", "8"))
+    viral_min_score: float = float(os.getenv("VIRAL_MIN_SCORE", "0.30"))
+    viral_top_k: int = int(os.getenv("VIRAL_TOP_K", "12"))
+    viral_max_terms: int = int(os.getenv("VIRAL_MAX_TERMS", "256"))
+    embed_cache_dir: str = os.getenv("EMBED_CACHE_DIR", "./.embed_cache")
+    
     class Config:
         env_file = ".env"
 
@@ -34,3 +43,4 @@ settings = Settings()
 os.makedirs(settings.upload_dir, exist_ok=True)
 os.makedirs(settings.output_dir, exist_ok=True)
 os.makedirs(settings.temp_dir, exist_ok=True)
+os.makedirs(settings.embed_cache_dir, exist_ok=True)

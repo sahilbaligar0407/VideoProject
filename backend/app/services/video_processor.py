@@ -12,6 +12,12 @@ from app.models import TranscriptionResult, HighlightSegment, GeneratedClip
 import aiofiles
 import asyncio
 
+# Viral Similarity Engine imports
+from app.viral import (
+    window_captions, score_windows_against_viral_vector, 
+    filter_windows_by_score, create_highlight_segments_from_windows
+)
+
 class VideoProcessor:
     def __init__(self):
         # OpenAI client will be initialized when needed
@@ -327,8 +333,20 @@ class VideoProcessor:
             ai_highlights = []
             print(f"🤖 AI analysis found 0 segments (skipped due to error)")
         
+        # Method 6: Viral Similarity Engine - 25% weight
+        print(f"🚀 Using Viral Similarity Engine for viral content detection...")
+        try:
+            viral_similarity_highlights = await self._score_viral(transcription, video_path)
+            for highlight in viral_similarity_highlights:
+                highlight.confidence_score *= 0.25
+            print(f"🚀 Viral similarity found {len(viral_similarity_highlights)} segments (25% weight)")
+        except Exception as e:
+            print(f"⚠️ Viral similarity analysis failed, continuing without it: {e}")
+            viral_similarity_highlights = []
+            print(f"🚀 Viral similarity found 0 segments (skipped due to error)")
+        
         # Combine all detection methods
-        all_segments = audio_highlights + engagement_highlights + viral_highlights + story_highlights + ai_highlights
+        all_segments = audio_highlights + engagement_highlights + viral_highlights + story_highlights + ai_highlights + viral_similarity_highlights
         print(f"📊 Found {len(all_segments)} potential highlight segments with weighted scoring")
         
         # CRITICAL FIX: Limit segments before expensive ranking (was causing hang)
@@ -1287,6 +1305,72 @@ class VideoProcessor:
             print(f"⚠️ Failed to parse ChatGPT response: {e}")
             return []
 
+    async def _score_viral(self, transcription: TranscriptionResult, video_path: str) -> List[HighlightSegment]:
+        """Score video content against viral vector using the Viral Similarity Engine."""
+        try:
+            print("🚀 Starting viral similarity scoring...")
+            
+            # Get video duration
+            video_duration = transcription.duration
+            
+            # Create caption windows
+            windows = window_captions(
+                segments=transcription.segments,
+                start=0,
+                end=video_duration,
+                window_sec=settings.viral_window_sec,
+                hop_sec=settings.viral_window_hop
+            )
+            
+            if not windows:
+                print("🚀 No caption windows created for viral scoring")
+                return []
+            
+            print(f"🚀 Created {len(windows)} caption windows for viral scoring")
+            
+            # Score windows against viral vector
+            scored_windows = await score_windows_against_viral_vector(windows)
+            
+            if not scored_windows:
+                print("🚀 No scored windows from viral similarity")
+                return []
+            
+            # Filter by minimum score and keep top K
+            top_windows = filter_windows_by_score(
+                scored_windows, 
+                settings.viral_min_score, 
+                settings.viral_top_k
+            )
+            
+            print(f"🚀 Viral similarity found {len(top_windows)} high-scoring windows")
+            
+            # Convert to HighlightSegment objects
+            viral_highlights = create_highlight_segments_from_windows(
+                top_windows, 
+                video_duration,
+                padding=2.0  # Add 2 seconds padding
+            )
+            
+            # Convert to HighlightSegment objects
+            highlights = []
+            for segment_data in viral_highlights:
+                highlight = HighlightSegment(
+                    start_time=segment_data["start_time"],
+                    end_time=segment_data["end_time"],
+                    duration=segment_data["end_time"] - segment_data["start_time"],
+                    confidence_score=segment_data["confidence_score"],
+                    keywords=segment_data["keywords"],
+                    transcript_segment=segment_data["text"]
+                )
+                highlights.append(highlight)
+            
+            print(f"🚀 Viral similarity engine generated {len(highlights)} highlight segments")
+            return highlights
+            
+        except Exception as e:
+            print(f"⚠️ Viral similarity scoring failed: {e}")
+            return []
+
     async def _rank_for_shorts_advanced(self, segments: List[HighlightSegment], 
                                        transcription: TranscriptionResult, 
                                        video_path: str) -> List[HighlightSegment]:
@@ -1358,8 +1442,14 @@ class VideoProcessor:
                 else:
                     transcript_score = 0.7  # Little dialogue
             
+            # 5. Viral similarity boost
+            viral_boost = 1.0
+            if hasattr(segment, 'keywords') and "viral_similarity" in segment.keywords:
+                viral_boost = 1.15  # 15% boost for viral similarity segments
+                print(f"🚀 Viral similarity boost applied to segment {segment.start_time:.1f}s-{segment.end_time:.1f}s")
+            
             # Calculate final weighted score
-            final_score = base_score * duration_score * position_score * diversity_score * transcript_score
+            final_score = base_score * duration_score * position_score * diversity_score * transcript_score * viral_boost
             segment.confidence_score = final_score
             
             print(f"📊 Segment {segment.start_time:.1f}s-{segment.end_time:.1f}s: "

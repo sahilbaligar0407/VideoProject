@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 class VideoInput(BaseModel):
@@ -60,3 +60,47 @@ class VideoProcessingResponse(BaseModel):
     message: str
     clips: Optional[List[GeneratedClip]] = None
     error: Optional[str] = None
+
+
+# Viral Similarity Engine Models
+class ViralTerm(BaseModel):
+    """Model for viral terms with weights."""
+    term: str
+    weight: float = 1.0
+
+
+class ScoredWindow(BaseModel):
+    """A caption window with its viral similarity score."""
+    start_time: float
+    end_time: float
+    score: float
+    text: str
+
+
+class ViralScoringRequest(BaseModel):
+    """Request model for viral scoring."""
+    captions: List[Dict[str, Any]]
+    video_duration: float
+
+
+class ViralScoringResponse(BaseModel):
+    """Response model for viral scoring."""
+    video_id: str
+    scored_windows: List[ScoredWindow]
+    total_windows: int
+    viral_vector_info: Dict[str, Any]
+
+
+class ViralTermsResponse(BaseModel):
+    """Response model for viral terms management."""
+    terms: List[ViralTerm]
+    total_count: int
+    max_terms: int
+
+
+class ViralVectorResponse(BaseModel):
+    """Response model for viral vector operations."""
+    vector_size: int
+    updated_at: str
+    model: str
+    terms_count: int
