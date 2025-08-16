@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     vertical_safe_bottom: int = 100
     
     # Caption settings
-    caption_mode: str = "sidecar"  # "burn", "sidecar", "off"
+    caption_mode: str = "burn"  # "burn", "sidecar", "off"
     caption_theme: dict = {
         "font": "Inter",
         "fontsize_vertical": 44,

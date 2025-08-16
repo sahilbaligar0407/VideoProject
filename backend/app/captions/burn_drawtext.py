@@ -460,7 +460,30 @@ def build_phrase_timed_captions(
     # Combine all filters
     all_filters = [background_filter] + filters
     
-    return ",".join(all_filters)
+    # Fallback: If no caption filters were created, create a simple test caption
+    if not filters:
+        print(f"⚠️ No caption filters created, adding fallback caption")
+        fallback_filter = (
+            f"drawtext=fontfile='{font_path}':text='Test Caption':"
+            f"x='(w-text_w)/2':y='if(gt(h-240-text_h,0),h-240-text_h,10)':"
+            f"fontsize={style_config['fontsize']}:fontcolor={style_config['fontcolor']}:"
+            f"box=1:boxcolor=black@0.6:boxborderw=20:"
+            f"enable='between(t,1.0,5.0)'"
+        )
+        all_filters.append(fallback_filter)
+    
+    # Add debug caption that stays visible throughout the clip for troubleshooting
+    debug_filter = (
+        f"drawtext=fontfile='{font_path}':text='DEBUG_CAPTION':"
+        f"x='(w-text_w)/2':y='h-50':"
+        f"fontsize=36:fontcolor=red:box=1:boxcolor=black@0.8:boxborderw=10:"
+        f"enable='1'"  # Always visible
+    )
+    all_filters.append(debug_filter)
+    
+    result = ",".join(all_filters)
+    print(f"🔍 Generated filter with {len(filters)} caption filters + 1 background filter + 1 debug filter")
+    return result
 
 def build_safe_phrase_captions(
     segments: List[Dict[str, Any]],
@@ -493,12 +516,27 @@ def build_safe_phrase_captions(
         if not segment.get('text'):
             continue
             
-        # Convert global times to clip-relative times
-        start_local = max(0.0, segment['start'] - clip_start)
-        end_local = max(0.1, segment['end'] - clip_start)
+        # Get timing from segments (these should already be clip-relative)
+        start_local = segment['start']
+        end_local = segment['end']
         
-        # Skip segments that are too short or off-screen
-        if end_local - start_local < 0.2:
+        # Sanity check: Ensure timing is valid
+        if start_local < 0:
+            print(f"⚠️ Segment {i+1}: start time negative ({start_local:.2f}s), clamping to 0")
+            start_local = 0.0
+            
+        if end_local <= start_local:
+            print(f"⚠️ Segment {i+1}: end <= start ({start_local:.2f}s <= {end_local:.2f}s), skipping")
+            continue
+            
+        # Clamp end times so END > START by at least 0.08s
+        if end_local - start_local < 0.08:
+            print(f"⚠️ Segment {i+1}: duration too short ({end_local - start_local:.2f}s), expanding to 0.08s")
+            end_local = start_local + 0.08
+            
+        # Skip segments that start too late relative to clip
+        if start_local > 60.0:  # Skip segments that start more than 60s into the clip
+            print(f"⚠️ Skipping segment {i+1}: starts too late ({start_local:.2f}s)")
             continue
             
         # Create safe, simple text for this segment
@@ -515,15 +553,18 @@ def build_safe_phrase_captions(
         
         # Skip if text is too short after cleaning
         if len(safe_text) < 5:
+            print(f"⚠️ Skipping segment {i+1}: text too short after cleaning")
             continue
         
-        # Build phrase filter with proper timing
+        print(f"✅ Processing segment {i+1}: '{safe_text}' ({start_local:.2f}s - {end_local:.2f}s)")
+        
+        # Build phrase filter with proper timing and clamped Y positioning
         phrase_filter = (
             f"drawtext=fontfile='{font_path}':text='{safe_text}':"
-            f"x='(w-text_w)/2':y='if(gt(h-240-text_h,0),h-240-text_h,10)':"
+            f"x='(w-text_w)/2':y='if(gt(h-240-text_h,0),h-240-text_h,10)':"  # Clamped Y positioning
             f"fontsize={style_config['fontsize']}:fontcolor={style_config['fontcolor']}:"
             f"box=1:boxcolor=black@0.6:boxborderw=20:"
-            f"enable='between(t,{start_local:.2f},{end_local:.2f})'"
+            f"enable='between(t,{start_local:.2f},{end_local:.2f})'"  # Use clip-relative times directly
         )
         filters.append(phrase_filter)
     

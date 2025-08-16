@@ -1017,7 +1017,7 @@ class VideoProcessor:
         return final_highlights
     
     async def _generate_clips(self, video_path: str, highlights: List[HighlightSegment], 
-                             transcription: TranscriptionResult, add_captions: bool = True, vertical: bool = True, caption_mode: str = "sidecar") -> List[GeneratedClip]:
+                             transcription: TranscriptionResult, add_captions: bool = True, vertical: bool = True, caption_mode: str = "burn") -> List[GeneratedClip]:
         """Generate video clips from highlight segments with smart clipping and vertical rendering"""
         clips = []
         
@@ -1163,12 +1163,30 @@ class VideoProcessor:
                 await self._export_sidecar_captions(base_noext, transcription, start_time, end_time)
                 
                 # Handle captions based on caption mode
-                if add_captions and caption_mode == "burn":
+                print(f"🔍 Caption handling: add_captions={add_captions}, caption_mode='{caption_mode}'")
+                
+                # FORCE BURN MODE: If add_captions is True, always use burn mode regardless of caption_mode
+                if add_captions:
+                    print(f"🎬 FORCING caption burning (add_captions=True) - ignoring caption_mode='{caption_mode}'")
                     try:
                         print(f"🎬 Burning captions with bulletproof drawtext...")
                         # Use SRT for more reliable caption rendering
                         ass_path = base_noext + ".ass"
+                        print(f"📝 ASS file path: {ass_path}")
+                        print(f"📝 ASS file exists: {os.path.exists(ass_path)}")
+                        
+                        # Safety check: Ensure ASS file exists and has content
+                        if not os.path.exists(ass_path):
+                            raise Exception(f"ASS file not found: {ass_path}")
+                        
+                        ass_size = os.path.getsize(ass_path)
+                        if ass_size < 100:  # ASS files should be at least 100 bytes
+                            raise Exception(f"ASS file too small ({ass_size} bytes): {ass_path}")
+                        
+                        print(f"📝 ASS file size: {ass_size} bytes")
+                        
                         final_clip_path = await self._burn_ass_captions(clip_path, ass_path, start_time)
+                        print(f"🔥 Caption burning returned: {final_clip_path}")
                         
                         # Verify the burned file is different from the original
                         if final_clip_path == clip_path:
@@ -1176,7 +1194,7 @@ class VideoProcessor:
                         
                         # Verify the published path is different from pre-burn path
                         if final_clip_path == clip_path:
-                            raise Exception("Caption burning failed - published_path == pre_burn_path")
+                            raise Exception("Caption burning failed - published_path == pre-burn_path")
                         
                         # ✅ Never publish the pre-burn file in burn mode
                         assert final_clip_path != clip_path, f"Burn mode returned original file: {clip_path}"
@@ -1188,27 +1206,42 @@ class VideoProcessor:
                         # Update manifest with burn status
                         await self._update_manifest_burn_status(base_noext, True, final_clip_path)
                         
+                        # Final verification: Ensure the captioned file exists and is different
+                        if not os.path.exists(final_clip_path):
+                            raise Exception(f"Captioned file was not created: {final_clip_path}")
+                        
+                        if os.path.getsize(final_clip_path) == os.path.getsize(clip_path):
+                            print(f"⚠️ Warning: Captioned file size matches original - captions may not be visible")
+                        
+                        print(f"✅ Final verification passed: Captioned file exists and is different")
+                        
                         # Use the burned file path for the clip object
                         file_path_to_publish = final_clip_path
                         
                     except Exception as e:
                         print(f"❌ Caption burning failed: {e}")
+                        print(f"🔍 Full error details:")
+                        import traceback
+                        traceback.print_exc()
                         # Fail fast - don't continue with uncaptioned file
                         raise Exception(f"Caption burning failed for clip {i+1}: {e}")
-                elif add_captions and caption_mode != "burn":
-                    print(f"⚠️ caption_mode is '{caption_mode}' (not 'burn') → no text will be visible on video.")
-                    print(f"📝 Using sidecar captions (VTT/ASS) — no burn.")
-                    final_clip_path = clip_path
-                    
-                    # Update manifest for sidecar mode
-                    await self._update_manifest_burn_status(base_noext, False, final_clip_path)
-                    
-                    # Use the original file path for sidecar mode
-                    file_path_to_publish = clip_path
                 elif not add_captions:
                     print(f"📝 Captions disabled — no burn.")
                     final_clip_path = clip_path
                     file_path_to_publish = clip_path
+                    
+                    # Update manifest for no-caption mode
+                    await self._update_manifest_burn_status(base_noext, False, final_clip_path)
+                else:
+                    # This should never happen with the force-burn logic above
+                    print(f"⚠️ Unexpected caption state: add_captions={add_captions}, caption_mode={caption_mode}")
+                    final_clip_path = clip_path
+                    file_path_to_publish = clip_path
+                
+                print(f"🔍 Final clip path: {file_path_to_publish}")
+                print(f"🔍 Final clip path exists: {os.path.exists(file_path_to_publish)}")
+                if os.path.exists(file_path_to_publish):
+                    print(f"🔍 Final clip size: {os.path.getsize(file_path_to_publish)} bytes")
                 
                 # Create clip object with the correct published path
                 clip = GeneratedClip(
@@ -1900,8 +1933,9 @@ class VideoProcessor:
             from app.captions.burn_drawtext import build_drawtext_filter, validate_filter_string
             
             # Build bulletproof drawtext filter chain with proper clip-relative timing
+            # Note: SRT parser already returns clip-relative times, so pass clip_start=0.0
             vf_value = build_drawtext_filter(
-                clip_start=clip_start,
+                clip_start=0.0,  # ← Stop subtracting twice - SRT times are already clip-relative
                 segments=captions,
                 style="poppins_bold_boxed",  # Use Poppins with boxed style
                 debug_watermark=False  # Watermark is added separately by video processor
@@ -1927,13 +1961,16 @@ class VideoProcessor:
             full_vf = f"{vf_value},{caps_watermark}"
             
             # ✅ Force pixel format first, add a background bar to guarantee visibility
-            # Note: vf_value already contains format=yuv420p and drawbox, so don't duplicate
+            # Prepend format=yuv420p and draw a soft background bar so we can always "see" something change
             if "format=yuv420p" not in vf_value:
                 full_vf = "format=yuv420p," + full_vf
             
             if "drawbox" not in vf_value:
                 # Add drawbox only if not already present
                 full_vf = "drawbox=x=0:y=h-340:w=1080:h=320:color=black@0.65:t=fill," + full_vf
+            
+            print(f"🔍 Final filter chain: {full_vf[:200]}...")
+            print(f"🔍 Filter length: {len(full_vf)} characters")
             
             cmd = [
                 "ffmpeg", "-i", video_path,

@@ -23,7 +23,7 @@ async def process_video(
     youtube_url: Optional[str] = Form(None),
     video_file: Optional[UploadFile] = File(None),
     add_captions: Optional[str] = Form("true"),
-    caption_mode: Optional[str] = Form("sidecar"),
+    caption_mode: Optional[str] = Form("burn"),
     user_topics: Optional[str] = Form(None),
     vertical: Optional[str] = Form("true")
 ):
@@ -47,7 +47,7 @@ async def process_video(
     
     # Parse parameters
     add_captions_bool = add_captions.lower() == "true" if add_captions else True
-    caption_mode_str = caption_mode if caption_mode else "sidecar"
+    caption_mode_str = caption_mode if caption_mode else "burn"
     vertical_bool = vertical.lower() == "true" if vertical else True
     
     # Parse user topics if provided
