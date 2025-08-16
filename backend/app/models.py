@@ -22,6 +22,7 @@ class HighlightSegment(BaseModel):
     confidence_score: float
     keywords: List[str]
     transcript_segment: str
+    detection_method: Optional[str] = None  # Method used to detect this highlight
 
 class GeneratedClip(BaseModel):
     """Model for generated highlight clips"""

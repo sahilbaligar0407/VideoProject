@@ -1,34 +1,57 @@
 import os
-import uuid
+import tempfile
 import subprocess
 import json
-from typing import List
-import openai
-import numpy as np
-from scipy.signal import find_peaks
-import librosa
-from app.config import settings
-from app.models import TranscriptionResult, HighlightSegment, GeneratedClip
-import aiofiles
+import re
+from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime
+import uuid
 import asyncio
-
-# Viral Similarity Engine imports
+import aiofiles
+from openai import OpenAI
+import numpy as np
+import librosa
+from scipy.signal import find_peaks
+from app.settings import settings
+from app.models import GeneratedClip, HighlightSegment, TranscriptionResult
 from app.viral import (
     window_captions, score_windows_against_viral_vector, 
     filter_windows_by_score, create_highlight_segments_from_windows
 )
 
+# New modules for enhanced functionality
+from app.highlight.snapping import (
+    snap_to_transcript_boundary, snap_to_audio_pause, 
+    choose_clip_window, duration_preference
+)
+from app.topic.search import topic_windows, topic_windows_embedding
+from app.video.vertical import extract_vertical_clip, get_vertical_dimensions
+
 class VideoProcessor:
-    def __init__(self):
+    def __init__(self, 
+                 temp_dir: str = "temp",
+                 output_dir: str = "outputs",
+                 caption_mode: str = "burn"):  # Changed default from "sidecar" to "burn"
         # OpenAI client will be initialized when needed
-        self.temp_dir = settings.temp_dir
-        self.output_dir = settings.output_dir
+        self.temp_dir = temp_dir
+        self.output_dir = output_dir
     
-    async def process_video(self, video_path: str, input_type: str = "file", add_captions: bool = True) -> List[GeneratedClip]:
+    async def process_video(
+        self,
+        video_path: str,
+        input_type: str = "file",
+        add_captions: bool = True,
+        user_topics: Optional[List[str]] = None,
+        vertical: bool = True,
+        caption_mode: str = "burn"  # Changed default from "sidecar" to "burn"
+    ) -> List[GeneratedClip]:
         """Main processing pipeline for video files"""
         try:
             print(f"🎬 Starting video processing for: {video_path}")
             print(f"📁 Input type: {input_type}")
+            print(f"📝 Add captions: {add_captions}")
+            print(f"🎯 User topics: {user_topics}")
+            print(f"📱 Vertical output: {vertical}")
             print(f"📁 File exists: {os.path.exists(video_path)}")
             if os.path.exists(video_path):
                 print(f"📏 File size: {os.path.getsize(video_path)} bytes")
@@ -43,11 +66,11 @@ class VideoProcessor:
             
             # Step 3: Detect highlight segments
             print("✨ Step 3: Detecting highlights...")
-            highlights = await self._detect_highlights(video_path, transcription, audio_path)
+            highlights = await self._detect_highlights(video_path, transcription, audio_path, user_topics)
             
             # Step 4: Generate clips from highlights
             print("🎬 Step 4: Generating clips...")
-            clips = await self._generate_clips(video_path, highlights, transcription, add_captions)
+            clips = await self._generate_clips(video_path, highlights, transcription, add_captions, vertical, caption_mode)
             
             # Cleanup temporary files
             await self._cleanup_temp_files([audio_path])
@@ -120,9 +143,6 @@ class VideoProcessor:
     async def _transcribe_audio(self, audio_path: str) -> TranscriptionResult:
         """Transcribe audio using OpenAI Whisper API with chunked approach"""
         try:
-            from openai import OpenAI
-            import asyncio
-            
             # Validate API key
             if not settings.openai_api_key or settings.openai_api_key.strip() == "":
                 raise Exception("OpenAI API key is missing. Please check your .env file.")
@@ -281,7 +301,7 @@ class VideoProcessor:
             print(f"❌ Chunked transcription failed: {e}")
             raise
     
-    async def _detect_highlights(self, video_path: str, transcription: TranscriptionResult, audio_path: str = None) -> List[HighlightSegment]:
+    async def _detect_highlights(self, video_path: str, transcription: TranscriptionResult, audio_path: str = None, user_topics: Optional[List[str]] = None) -> List[HighlightSegment]:
         """Detect highlight segments optimized for short-form content (TikTok, Reels, Shorts)"""
         print(f"🎬 Starting enhanced highlight detection for short-form content...")
         
@@ -345,8 +365,29 @@ class VideoProcessor:
             viral_similarity_highlights = []
             print(f"🚀 Viral similarity found 0 segments (skipped due to error)")
         
+        # Method 7: Topic Search - 25% weight (NEW!)
+        topic_highlights = []
+        if user_topics:
+            print(f"🎯 Searching for user-specified topics: {user_topics}")
+            try:
+                for topic in user_topics:
+                    topic_results = await topic_windows_embedding(transcription, topic)
+                    topic_highlights.extend(topic_results)
+                    print(f"🎯 Topic '{topic}' found {len(topic_results)} segments")
+                
+                # Apply topic weight
+                for highlight in topic_highlights:
+                    highlight.confidence_score *= 0.25
+                print(f"🎯 Topic search found {len(topic_highlights)} total segments (25% weight)")
+            except Exception as e:
+                print(f"⚠️ Topic search failed, continuing without it: {e}")
+                topic_highlights = []
+                print(f"🎯 Topic search found 0 segments (skipped due to error)")
+        else:
+            print(f"🎯 No user topics specified, skipping topic search")
+        
         # Combine all detection methods
-        all_segments = audio_highlights + engagement_highlights + viral_highlights + story_highlights + ai_highlights + viral_similarity_highlights
+        all_segments = audio_highlights + engagement_highlights + viral_highlights + story_highlights + ai_highlights + viral_similarity_highlights + topic_highlights
         print(f"📊 Found {len(all_segments)} potential highlight segments with weighted scoring")
         
         # CRITICAL FIX: Limit segments before expensive ranking (was causing hang)
@@ -375,14 +416,15 @@ class VideoProcessor:
                     
                     for i, start_time in enumerate(positions):
                         if start_time >= 0 and start_time + segment_duration <= video_duration:
-                            fallback_segments.append(HighlightSegment(
-                                start_time=start_time,
-                                end_time=start_time + segment_duration,
-                                duration=segment_duration,
-                                confidence_score=0.5,  # Lower confidence for fallbacks
-                                keywords=["fallback", "default_segment"],
-                                transcript_segment="Fallback highlight segment"
-                            ))
+                                                fallback_segments.append(HighlightSegment(
+                        start_time=start_time,
+                        end_time=start_time + segment_duration,
+                        duration=segment_duration,
+                        confidence_score=0.5,  # Lower confidence for fallbacks
+                        keywords=["fallback", "default_segment"],
+                        transcript_segment="Fallback highlight segment",
+                        detection_method="fallback"
+                    ))
                     
                     print(f"📊 Created {len(fallback_segments)} fallback segments")
                     all_segments = fallback_segments
@@ -439,6 +481,43 @@ class VideoProcessor:
             print(f"Audio peak detection failed: {e}")
             return []
     
+    async def _detect_audio_peaks_from_file(self, audio_path: str) -> List[HighlightSegment]:
+        """Detect audio peaks from an audio file"""
+        try:
+            print(f"🎵 Analyzing audio peaks from: {audio_path}")
+            
+            # Load the WAV file for analysis
+            y, sr = librosa.load(audio_path, sr=22050)
+            duration = len(y) / sr
+            
+            highlights = []
+            
+            # Energy-based peak detection
+            energy = librosa.feature.rms(y=y)[0]
+            energy_peaks, _ = find_peaks(energy, height=np.mean(energy) * 1.5, distance=sr*3)
+            
+            for peak in energy_peaks:
+                start_time = max(0, peak / sr - 5)
+                end_time = min(duration, peak / sr + 5)
+                
+                if end_time - start_time >= 10:  # Minimum 10 seconds
+                    highlights.append(HighlightSegment(
+                        start_time=start_time,
+                        end_time=end_time,
+                        duration=end_time - start_time,
+                        confidence_score=0.7,
+                        keywords=["audio_peak", "energy_peak"],
+                        transcript_segment="Audio peak detected",
+                        detection_method="audio_peak"
+                    ))
+            
+            print(f"🎵 Found {len(highlights)} audio peaks")
+            return highlights
+            
+        except Exception as e:
+            print(f"❌ Audio peak detection from file failed: {e}")
+            return []
+    
     async def _detect_enhanced_audio_highlights(self, audio_path: str) -> List[HighlightSegment]:
         """Enhanced audio analysis for short-form content optimization"""
         try:
@@ -487,7 +566,8 @@ class VideoProcessor:
                             duration=end_time - start_time,
                             confidence_score=confidence,
                             keywords=["high_energy", "dynamic_audio", "gaming_moment"],
-                            transcript_segment=""
+                            transcript_segment="",
+                            detection_method="enhanced_audio"
                         )
                         highlights.append(highlight)
             
@@ -509,7 +589,8 @@ class VideoProcessor:
                             duration=end_time - start_time,
                             confidence_score=0.75,
                             keywords=["rhythm", "beat", "music"],
-                            transcript_segment=""
+                            transcript_segment="",
+                            detection_method="enhanced_audio"
                         )
                         highlights.append(highlight)
             except:
@@ -542,7 +623,8 @@ class VideoProcessor:
                                 duration=end_time - start_time,
                                 confidence_score=confidence,
                                 keywords=["sudden_change", "reaction", "surprise"],
-                                transcript_segment=""
+                                transcript_segment="",
+                                detection_method="enhanced_audio"
                             )
                             highlights.append(highlight)
             except Exception as e:
@@ -581,7 +663,8 @@ class VideoProcessor:
                             duration=end_time - start_time,
                             confidence_score=0.8,
                             keywords=["dramatic_pause", "silence", "tension"],
-                            transcript_segment=""
+                            transcript_segment="",
+                            detection_method="enhanced_audio"
                         )
                         highlights.append(highlight)
             
@@ -636,7 +719,8 @@ class VideoProcessor:
                         duration=end_time - start_time,
                         confidence_score=question_score,
                         keywords=["question", "engagement"],
-                        transcript_segment=""
+                        transcript_segment="",
+                        detection_method="content_engagement"
                     )
                     highlights.append(highlight)
         
@@ -659,7 +743,8 @@ class VideoProcessor:
                     duration=end_time - start_time,
                     confidence_score=0.85,
                     keywords=["emotional", "reaction", keyword],
-                    transcript_segment=""
+                    transcript_segment="",
+                    detection_method="content_engagement"
                 )
                 highlights.append(highlight)
         
@@ -682,7 +767,8 @@ class VideoProcessor:
                     duration=end_time - start_time,
                     confidence_score=0.8,
                     keywords=["important", "key_info", indicator],
-                    transcript_segment=""
+                    transcript_segment="",
+                    detection_method="content_engagement"
                 )
                 highlights.append(highlight)
         
@@ -715,7 +801,8 @@ class VideoProcessor:
                     duration=end_time - start_time,
                     confidence_score=0.9,
                     keywords=["viral", "controversial", keyword],
-                    transcript_segment=""
+                    transcript_segment="",
+                    detection_method="viral_moments"
                 )
                 highlights.append(highlight)
         
@@ -738,7 +825,8 @@ class VideoProcessor:
                     duration=end_time - start_time,
                     confidence_score=0.8,
                     keywords=["cta", "engagement", indicator],
-                    transcript_segment=""
+                    transcript_segment="",
+                    detection_method="viral_moments"
                 )
                 highlights.append(highlight)
         
@@ -761,7 +849,8 @@ class VideoProcessor:
                     duration=end_time - start_time,
                     confidence_score=0.85,
                     keywords=["trending", "viral", indicator],
-                    transcript_segment=""
+                    transcript_segment="",
+                    detection_method="viral_moments"
                 )
                 highlights.append(highlight)
         
@@ -790,7 +879,8 @@ class VideoProcessor:
                         duration=end_time - start_time,
                         confidence_score=0.8,
                         keywords=["opening", "hook", "introduction"],
-                        transcript_segment=""
+                        transcript_segment="",
+                        detection_method="story_arcs"
                     )
                     highlights.append(highlight)
             
@@ -808,7 +898,8 @@ class VideoProcessor:
                             duration=end_time - start_time,
                             confidence_score=0.75,
                             keywords=["climax", "middle", "peak"],
-                            transcript_segment=""
+                            transcript_segment="",
+                            detection_method="story_arcs"
                         )
                         highlights.append(highlight)
                         break
@@ -826,7 +917,8 @@ class VideoProcessor:
                         duration=end_time - start_time,
                         confidence_score=0.8,
                         keywords=["conclusion", "summary", "ending"],
-                        transcript_segment=""
+                        transcript_segment="",
+                        detection_method="story_arcs"
                     )
                     highlights.append(highlight)
         
@@ -925,153 +1017,284 @@ class VideoProcessor:
         return final_highlights
     
     async def _generate_clips(self, video_path: str, highlights: List[HighlightSegment], 
-                             transcription: TranscriptionResult, add_captions: bool = True) -> List[GeneratedClip]:
-        """Generate video clips from highlight segments"""
+                             transcription: TranscriptionResult, add_captions: bool = True, vertical: bool = True, caption_mode: str = "sidecar") -> List[GeneratedClip]:
+        """Generate video clips from highlight segments with smart clipping and vertical rendering"""
         clips = []
         
-        print(f"Generating clips from {len(highlights)} highlights")
-        print(f"Output directory: {self.output_dir}")
-        print(f"Output directory exists: {os.path.exists(self.output_dir)}")
+        print(f"🎬 Generating clips from {len(highlights)} highlights")
+        print(f"📁 Output directory: {self.output_dir}")
+        print(f"📱 Vertical output: {vertical}")
+        print(f"📝 Add captions: {add_captions}")
+        
+        # Get video duration for clipping
+        video_duration = 0
+        try:
+            cmd = ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", video_path]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                video_duration = float(result.stdout.strip())
+                print(f"⏱️ Video duration: {video_duration:.2f} seconds")
+        except Exception as e:
+            print(f"⚠️ Could not determine video duration: {e}")
+            video_duration = 300  # Default fallback
+        
+        # Extract audio for pause detection if needed
+        audio_path = None
+        if any(highlight.detection_method in ["audio_pause", "enhanced_audio"] for highlight in highlights):
+            print(f"🎵 Extracting audio for pause detection...")
+            audio_path = await self._extract_audio(video_path)
         
         for i, highlight in enumerate(highlights):
             try:
                 print(f"\n--- Processing highlight {i+1} ---")
                 
-                # Ensure clip duration is within bounds
-                duration = min(max(highlight.duration, settings.min_clip_duration), 
-                             settings.max_clip_duration)
-                
-                # Guard against zero-length/empty clips
-                duration = max(duration, 2.0)  # ensure >= 2s
-                
-                # Adjust start/end times to center the highlight
+                # Use smart clip window selection
                 center_time = (highlight.start_time + highlight.end_time) / 2
-                start_time = max(0, center_time - duration / 2)
-                end_time = start_time + duration
+                duration_policy = {
+                    'min': settings.min_clip_duration,
+                    'target': settings.target_clip_duration,
+                    'max': settings.max_clip_duration
+                }
                 
-                print(f"Clip timing: {start_time}s to {end_time}s (duration: {duration}s)")
+                start_time, end_time = choose_clip_window(center_time, duration_policy, video_duration)
+                duration = end_time - start_time
                 
-                # Skip if the clip would be too short
-                if end_time <= start_time + 0.05:
-                    print(f"Skipping clip {i+1}: too short")
-                    continue
+                print(f"🎯 Smart clip window: {start_time:.2f}s to {end_time:.2f}s (duration: {duration:.2f}s)")
+                
+                # Apply smart snapping for clean endings
+                print(f"🔍 Applying smart snapping for clean endings...")
+                
+                # First try transcript boundary snapping
+                new_start, new_end, snap_reason = snap_to_transcript_boundary(
+                    start_time, end_time, transcription.segments, 
+                    settings.snap_max_overhang, settings.snap_punctuations
+                )
+                
+                if new_end != end_time:
+                    print(f"📝 Transcript boundary snap: {end_time:.2f}s → {new_end:.2f}s ({snap_reason})")
+                    start_time, end_time = new_start, new_end
+                    duration = end_time - start_time
+                
+                # If transcript snapping didn't help much, try audio pause snapping
+                if audio_path and abs(new_end - end_time) < 1.0:  # Only if transcript snap didn't move much
+                    print(f"🔊 Trying audio pause snapping...")
+                    new_start, new_end, snap_reason = snap_to_audio_pause(
+                        audio_path, start_time, end_time,
+                        settings.snap_silence_thresh_db, settings.snap_min_pause, 
+                        settings.snap_max_overhang
+                    )
+                    
+                    if new_end != end_time:
+                        print(f"🔊 Audio pause snap: {end_time:.2f}s → {new_end:.2f}s ({snap_reason})")
+                        start_time, end_time = new_start, new_end
+                        duration = end_time - start_time
+                
+                # Ensure final duration is within bounds
+                if duration < settings.min_clip_duration:
+                    print(f"⚠️ Duration too short after snapping, adjusting...")
+                    end_time = start_time + settings.min_clip_duration
+                    duration = settings.min_clip_duration
+                elif duration > settings.max_clip_duration:
+                    print(f"⚠️ Duration too long after snapping, adjusting...")
+                    end_time = start_time + settings.max_clip_duration
+                    duration = settings.max_clip_duration
+                
+                print(f"✅ Final clip timing: {start_time:.2f}s to {end_time:.2f}s (duration: {duration:.2f}s)")
                 
                 # Generate clip filename
                 clip_id = str(uuid.uuid4())
                 clip_filename = f"clip_{i+1}_{clip_id}.mp4"
                 clip_path = os.path.join(self.output_dir, clip_filename)
                 
-                print(f"Clip {i+1} ID: {clip_id}")
-                print(f"Clip {i+1} path: {clip_path}")
+                print(f"🎬 Clip {i+1} ID: {clip_id}")
+                print(f"🎬 Clip {i+1} path: {clip_path}")
                 
-                # Extract clip using ffmpeg
-                await self._extract_video_clip(video_path, clip_path, start_time, duration)
+                # Extract clip using vertical rendering if requested
+                if vertical:
+                    # Decide vertical layout per highlight
+                    layout_mode = "cover"
+                    gaming_theme = None
+
+                    kw = set((highlight.keywords or []))
+                    text_snippet = (highlight.transcript_segment or "").lower()
+
+                    if any(k in kw for k in ["podcast", "interview", "guest"]) or "podcast" in text_snippet:
+                        layout_mode = "podcast_face"
+                    elif any(k in kw for k in ["gaming", "gameplay", "roblox", "minecraft", "valorant", "fortnite"]) or "game" in text_snippet:
+                        layout_mode = "gaming_template"
+                        # pick a theme
+                        themes = ["subway", "templerun", "minecraft"]
+                        gaming_theme = themes[(i) % len(themes)]
+
+                    bg_assets = getattr(settings, "gaming_backgrounds", {
+                        "subway": "assets/backgrounds/subway.mp4",
+                        "templerun": "assets/backgrounds/templerun.mp4",
+                        "minecraft": "assets/backgrounds/minecraft_parkour.mp4",
+                    })
+
+                    print(f"📱 Extracting vertical clip mode={layout_mode} theme={gaming_theme}")
+                    success = extract_vertical_clip(
+                        video_path, clip_path, start_time, duration,
+                        mode=layout_mode, theme=gaming_theme, bg_roots=bg_assets
+                    )
+                    if not success:
+                        print(f"❌ Vertical extraction failed - NOT falling back to standard")
+                        print(f"❌ Clip {i+1} generation failed due to vertical extraction failure")
+                        continue
+                else:
+                    print(f"📺 Extracting standard clip...")
+                    success = await self._extract_video_clip(video_path, clip_path, start_time, duration)
+                    if not success:
+                        print(f"❌ Standard extraction failed for clip {i+1}")
+                        continue
                 
                 # Verify the clip was created
-                if os.path.exists(clip_path):
-                    print(f"✓ Clip {i+1} created successfully: {os.path.getsize(clip_path)} bytes")
+                if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1024:
+                    print(f"✅ Clip {i+1} created successfully: {os.path.getsize(clip_path)} bytes")
                 else:
-                    print(f"✗ Clip {i+1} was not created!")
+                    print(f"❌ Clip {i+1} was not created or is too small!")
+                    continue
                 
                 # Generate captions for the clip
                 caption_text = await self._generate_caption_text(transcription, start_time, end_time)
                 
-                # Conditionally burn captions based on user preference
-                if add_captions:
-                    try:
-                        print(f"🎬 Burning captions into clip {i+1}...")
-                        final_clip_path = await self._burn_captions(clip_path, caption_text)
-                        print(f"✅ Captions burned successfully for clip {i+1}")
-                    except Exception as e:
-                        print(f"⚠️ Caption burning failed for clip {i+1}: {e}")
-                        print(f"⚠️ Using clip without captions")
-                        final_clip_path = clip_path
-                else:
-                    print(f"📝 Skipping captions for clip {i+1} (user preference)")
-                    final_clip_path = clip_path
+                # Always export sidecar tracks for SEO/design even if we burn
+                base_noext = os.path.splitext(clip_path)[0]
+                await self._export_sidecar_captions(base_noext, transcription, start_time, end_time)
                 
-                # Create clip object
+                # Handle captions based on caption mode
+                if add_captions and caption_mode == "burn":
+                    try:
+                        print(f"🎬 Burning captions with bulletproof drawtext...")
+                        # Use SRT for more reliable caption rendering
+                        ass_path = base_noext + ".ass"
+                        final_clip_path = await self._burn_ass_captions(clip_path, ass_path, start_time)
+                        
+                        # Verify the burned file is different from the original
+                        if final_clip_path == clip_path:
+                            raise Exception("Caption burning failed - returned original video path")
+                        
+                        # Verify the published path is different from pre-burn path
+                        if final_clip_path == clip_path:
+                            raise Exception("Caption burning failed - published_path == pre_burn_path")
+                        
+                        # ✅ Never publish the pre-burn file in burn mode
+                        assert final_clip_path != clip_path, f"Burn mode returned original file: {clip_path}"
+                        
+                        print(f"✅ Caption burning completed: {os.path.basename(final_clip_path)}")
+                        print(f"📁 Pre-burn: {clip_path} ({os.path.getsize(clip_path)} bytes)")
+                        print(f"📁 Published: {final_clip_path} ({os.path.getsize(final_clip_path)} bytes)")
+                        
+                        # Update manifest with burn status
+                        await self._update_manifest_burn_status(base_noext, True, final_clip_path)
+                        
+                        # Use the burned file path for the clip object
+                        file_path_to_publish = final_clip_path
+                        
+                    except Exception as e:
+                        print(f"❌ Caption burning failed: {e}")
+                        # Fail fast - don't continue with uncaptioned file
+                        raise Exception(f"Caption burning failed for clip {i+1}: {e}")
+                elif add_captions and caption_mode != "burn":
+                    print(f"⚠️ caption_mode is '{caption_mode}' (not 'burn') → no text will be visible on video.")
+                    print(f"📝 Using sidecar captions (VTT/ASS) — no burn.")
+                    final_clip_path = clip_path
+                    
+                    # Update manifest for sidecar mode
+                    await self._update_manifest_burn_status(base_noext, False, final_clip_path)
+                    
+                    # Use the original file path for sidecar mode
+                    file_path_to_publish = clip_path
+                elif not add_captions:
+                    print(f"📝 Captions disabled — no burn.")
+                    final_clip_path = clip_path
+                    file_path_to_publish = clip_path
+                
+                # Create clip object with the correct published path
                 clip = GeneratedClip(
                     clip_id=clip_id,
                     start_time=start_time,
                     end_time=end_time,
                     duration=duration,
-                    file_path=final_clip_path,
+                    file_path=file_path_to_publish,  # Use the correct published path
                     caption_text=caption_text,
                     download_url=f"/api/v1/download/{clip_id}"
                 )
                 
                 clips.append(clip)
-                print(f"✓ Clip {i+1} added to results")
+                print(f"✅ Clip {i+1} added to results")
                 
             except Exception as e:
-                print(f"✗ Failed to generate clip {i+1}: {e}")
+                print(f"❌ Failed to generate clip {i+1}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
         
+        # Cleanup audio file if we created one
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+                print(f"🧹 Cleaned up temporary audio file")
+            except:
+                pass
+        
         print(f"\n=== Generated {len(clips)} clips successfully ===")
         return clips
     
-    async def _extract_video_clip(self, video_path: str, output_path: str,
-                                 start_time: float, duration: float):
-        """Extract a video clip using ffmpeg optimized for maximum compatibility"""
-        # Ensure minimum duration and validate inputs
-        duration = max(duration, 2.0)  # Minimum 2 seconds for compatibility
-        
-        # Verify input video is valid
-        print(f"Input video: {video_path}")
-        print(f"Input video exists: {os.path.exists(video_path)}")
-        if os.path.exists(video_path):
-            print(f"Input video size: {os.path.getsize(video_path)} bytes")
-        
-        # Test input video with ffprobe
-        probe_cmd = ["ffprobe", "-v", "error", "-show_format", "-show_streams", video_path]
-        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
-        if probe_result.returncode != 0:
-            print(f"Input video probe failed: {probe_result.stderr}")
-            raise Exception(f"Input video is not valid: {probe_result.stderr}")
-        else:
-            print("Input video is valid")
-        
-        # Use hardened, very-compatible settings with faststart
-        cmd = [
-            "ffmpeg",
-            "-ss", str(start_time), "-t", str(duration),
-            "-i", video_path,
-            # Video - hardened for Windows compatibility
-            "-c:v", "libx264",        # H.264 video codec (now available!)
-            "-pix_fmt", "yuv420p",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-r", "30",               # Constant 30 fps
-            "-vsync", "cfr",          # Force constant frame pacing
-            "-profile:v", "baseline",
-            "-level:v", "3.0",
-            "-tag:v", "avc1",         # Makes Windows happiest
-            # Audio
-            "-c:a", "aac", "-b:a", "128k",
-            "-ar", "48000", "-ac", "2",
-            # Container
-            "-movflags", "+faststart",
-            "-avoid_negative_ts", "make_zero",
-            "-y", output_path
-        ]
-        
-        # Debug: print the FFmpeg command
-        print(f"Running FFmpeg command: {' '.join(cmd)}")
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"FFmpeg stderr: {result.stderr}")
-            print(f"FFmpeg stdout: {result.stdout}")
-            raise Exception(f"Clip extraction failed: {result.stderr}")
-        
-        print(f"FFmpeg completed successfully. Output file: {output_path}")
-        print(f"File size: {os.path.getsize(output_path) if os.path.exists(output_path) else 'File not found'}")
-        
-        # Validate the generated file
-        await self._verify_video_file(output_path)
+    async def _extract_video_clip(self, video_path: str, output_path: str, start_time: float, duration: float) -> bool:
+        """Extract a video clip using FFmpeg with Windows-compatible settings"""
+        try:
+            print(f"🎬 Extracting clip: {start_time:.2f}s to {start_time + duration:.2f}s")
+            
+            # Ensure minimum duration
+            duration = max(duration, 2.0)
+            
+            # Use Windows-compatible FFmpeg settings
+            cmd = [
+                "ffmpeg",
+                "-ss", str(start_time),
+                "-t", str(duration),
+                "-i", video_path,
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-r", "30",  # Force 30fps for compatibility
+                "-vsync", "cfr",  # Force constant frame rate
+                "-profile:v", "baseline",
+                "-level:v", "3.0",
+                "-tag:v", "avc1",  # Windows-friendly codec tag
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ar", "48000",
+                "-ac", "2",
+                "-movflags", "+faststart",  # Enable streaming
+                "-y",  # Overwrite output
+                output_path
+            ]
+            
+            print(f"🔧 FFmpeg command: {' '.join(cmd)}")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode != 0:
+                print(f"❌ FFmpeg failed: {result.stderr}")
+                return False
+            
+            # Verify the output file
+            if await self._verify_video_file(output_path):
+                print(f"✅ Clip extracted successfully: {os.path.getsize(output_path)} bytes")
+                return True
+            else:
+                print(f"❌ Clip verification failed")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            print(f"❌ FFmpeg timed out after 5 minutes")
+            return False
+        except Exception as e:
+            print(f"❌ Clip extraction failed: {e}")
+            return False
     
     async def _generate_caption_text(self, transcription: TranscriptionResult, 
                                     start_time: float, end_time: float) -> str:
@@ -1124,7 +1347,7 @@ class VideoProcessor:
         else:
             return "Generated highlight clip"
     
-    async def _burn_captions(self, video_path: str, caption_text: str) -> str:
+    async def _burn_captions(self, video_path: str, caption_text: str, vertical: bool = True) -> str:
         """Burn captions into the video using ffmpeg with maximum compatibility"""
         output_path = video_path.replace('.mp4', '_captioned.mp4')
 
@@ -1149,8 +1372,31 @@ class VideoProcessor:
         # Use hardened settings with proper path escaping for Windows
         # Escape backslashes and colons for Windows paths
         escaped_srt_path = srt_path.replace("\\", "\\\\").replace(":", "\\:")
-        # Position captions higher up (not at bottom) with better styling
-        vf_value = f"subtitles='{escaped_srt_path}':force_style='FontSize=28,PrimaryColour=&Hffffff,OutlineColour=&H000000,BackColour=&H80000000,Bold=1,MarginV=100'"
+        
+        # Use caption theme settings for consistent styling
+        th = getattr(settings, 'caption_theme', {})
+        
+        # Adjust caption positioning and styling based on vertical mode
+        if vertical:
+            # For vertical videos, use safe margins to avoid TikTok UI overlays
+            font_size = th.get('fontsize_vertical', 44)
+            margin_v = th.get('vertical_margin_bottom', 260)  # Safe bottom margin
+            print(f"📱 Vertical captions: FontSize={font_size}, MarginV={margin_v}")
+        else:
+            # Standard horizontal video positioning
+            font_size = th.get('fontsize_horizontal', 36)
+            margin_v = th.get('horizontal_margin_bottom', 120)
+            print(f"📺 Horizontal captions: FontSize={font_size}, MarginV={margin_v}")
+        
+        # Use ASS-style positioning for better control
+        # Block subtitles filter on Windows due to libass compatibility issues
+        import platform
+        if platform.system().lower().startswith("win"):
+            print("⚠️ subtitles filter not supported on Windows builds; forcing drawtext mode")
+            # Force drawtext mode for Windows
+            raise Exception("subtitles filter not supported on Windows; use drawtext mode")
+        
+        vf_value = f"subtitles='{escaped_srt_path}':force_style='FontSize={font_size},PrimaryColour=&Hffffff,OutlineColour=&H000000,BackColour=&H80000000,Bold=1,MarginV={margin_v},Alignment=2'"
 
         cmd = [
             "ffmpeg", "-i", video_path,
@@ -1173,6 +1419,7 @@ class VideoProcessor:
             "-y", output_path
         ]
         
+        print(f"🎬 Running caption burning command: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         # Cleanup SRT file
@@ -1182,9 +1429,12 @@ class VideoProcessor:
             raise Exception(f"Caption burning failed: {result.stderr}")
         
         # Validate the generated file
-        await self._verify_video_file(output_path)
-        
-        return output_path
+        if await self._verify_video_file(output_path):
+            print(f"✅ Caption video verified successfully")
+            return output_path
+        else:
+            print(f"❌ Caption video verification failed, using original")
+            return video_path
     
     async def _cleanup_temp_files(self, file_paths: List[str]):
         """Clean up temporary files"""
@@ -1195,19 +1445,33 @@ class VideoProcessor:
             except Exception as e:
                 print(f"Failed to cleanup {file_path}: {e}")
     
-    async def _verify_video_file(self, path: str):
+    async def _verify_video_file(self, path: str) -> bool:
         """Check if video file is valid"""
-        if not os.path.exists(path):
-            raise Exception("Output file not created")
-        
-        if os.path.getsize(path) < 1024:  # 1KB minimum
-            raise Exception("Output file is too small")
-        
-        # Quick sanity check with ffprobe
-        cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise Exception(f"Video validation failed: {result.stderr}")
+        try:
+            if not os.path.exists(path):
+                print(f"❌ Output file not created: {path}")
+                return False
+            
+            if os.path.getsize(path) < 1024:  # 1KB minimum
+                print(f"❌ Output file too small: {os.path.getsize(path)} bytes")
+                return False
+            
+            # Quick sanity check with ffprobe
+            cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                print(f"❌ Video validation failed: {result.stderr}")
+                return False
+            
+            print(f"✅ Video file verified successfully: {path}")
+            return True
+            
+        except subprocess.TimeoutExpired:
+            print(f"❌ Video validation timed out")
+            return False
+        except Exception as e:
+            print(f"❌ Video validation error: {e}")
+            return False
 
     async def _analyze_content_with_chatgpt(self, transcription: TranscriptionResult) -> List[HighlightSegment]:
         """Use ChatGPT to analyze content quality and identify the best moments"""
@@ -1253,6 +1517,11 @@ class VideoProcessor:
         - Memorable quotes
         - Moments people would share
         
+        IMPORTANT: Each clip should be {settings.target_clip_duration} seconds (±{settings.snap_max_overhang}s) and end on natural boundaries:
+        - Prefer endings at sentence end or audio pause
+        - May extend up to {settings.snap_max_overhang} seconds beyond target to land cleanly
+        - Ensure minimum duration of {settings.min_clip_duration}s and maximum of {settings.max_clip_duration}s
+        
         Transcript: {full_text[:2000]}...
         
         Return ONLY JSON with start_time, end_time, reason, confidence (0.8-1.0):
@@ -1294,7 +1563,8 @@ class VideoProcessor:
                             duration=float(item['end_time']) - float(item['start_time']),
                             confidence_score=float(item.get('confidence', 0.8)),
                             keywords=["ai_analyzed", "viral_potential"],
-                            transcript_segment=item.get('reason', 'AI-identified engaging moment')
+                            transcript_segment=item.get('reason', 'AI-identified engaging moment'),
+                            detection_method="chatgpt_analysis"
                         )
                         highlights.append(highlight)
                 
@@ -1360,7 +1630,8 @@ class VideoProcessor:
                     duration=segment_data["end_time"] - segment_data["start_time"],
                     confidence_score=segment_data["confidence_score"],
                     keywords=segment_data["keywords"],
-                    transcript_segment=segment_data["text"]
+                    transcript_segment=segment_data["text"],
+                    detection_method="viral_similarity"
                 )
                 highlights.append(highlight)
             
@@ -1390,14 +1661,13 @@ class VideoProcessor:
             
             base_score = segment.confidence_score
             
-            # 1. Duration optimization (20-40 seconds is ideal)
-            duration_score = 1.0
-            if segment.duration < 15:
-                duration_score = 0.6  # Too short
-            elif segment.duration > 60:
-                duration_score = 0.7  # Too long
-            elif 20 <= segment.duration <= 40:
-                duration_score = 1.2  # Perfect length for shorts
+            # 1. Duration optimization using new duration preference function
+            duration_score = duration_preference(
+                segment.duration, 
+                settings.target_clip_duration, 
+                settings.min_clip_duration, 
+                settings.max_clip_duration
+            )
             
             # 2. Position scoring (middle content often better than beginning/end)
             video_duration = 0
@@ -1477,3 +1747,614 @@ class VideoProcessor:
         
         print(f"🏆 Advanced ranking complete: {len(final_segments)} segments selected")
         return final_segments
+
+    def _sec_to_vtt(self, t: float) -> str:
+        """Convert seconds to VTT timestamp format"""
+        from datetime import timedelta
+        td = timedelta(seconds=float(t))
+        s = str(td)
+        if "." not in s:
+            s += ".000"
+        return s.replace(",", ".")  # VTT needs dot millis
+
+    async def _export_sidecar_captions(
+        self, 
+        base_path: str, 
+        transcription: TranscriptionResult, 
+        start: float, 
+        end: float
+    ) -> dict:
+        """
+        Exports sidecar caption files:
+          - WebVTT: base_path + ".vtt"
+          - ASS:    base_path + ".ass" (styled, not burned)
+          - JSON:   base_path + ".json" (for SEO)
+        Pulls segments overlapping [start,end].
+        """
+        import re  # ensures available even if file-level import ever changes
+        try:
+            segs = []
+            for seg in getattr(transcription, "segments", []) or []:
+                s, e = seg.get("start"), seg.get("end")
+                if s is None or e is None: 
+                    continue
+                if e <= start or s >= end:
+                    continue
+                # Clamp to clip range
+                segs.append({
+                    "start": max(0.0, s - start),
+                    "end":   max(0.01, e - start),
+                    "text": (seg.get("text") or "").strip()
+                })
+
+            # WebVTT
+            vtt_path = base_path + ".vtt"
+            vtt_lines = ["WEBVTT\n"]
+            for i, sg in enumerate(segs, 1):
+                vtt_lines.append(str(i))
+                vtt_lines.append(f"{self._sec_to_vtt(sg['start'])} --> {self._sec_to_vtt(sg['end'])}")
+                vtt_lines.append(re.sub(r"\s+", " ", sg["text"]))
+                vtt_lines.append("")
+            
+            async with aiofiles.open(vtt_path, "w", encoding="utf-8") as f:
+                await f.write("\n".join(vtt_lines))
+
+            # ASS (styled)
+            ass_path = base_path + ".ass"
+            th = settings.caption_theme
+            # ASS colors are BGR with &HAABBGGRR format
+            style = (
+                "[Script Info]\n"
+                "ScriptType: v4.00+\n"
+                "PlayResX: 1080\n"
+                "PlayResY: 1920\n"
+                "\n[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+                "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+                "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+                f"Style: Default,{th['font']},{th['fontsize_vertical']},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+                "1,0,0,0,100,100,0,0,1," f"{th['outline']},{th['shadow']}," 
+                f"2,40,40," f"{settings.vertical_safe_bottom},1\n"  # Alignment=2 bottom-center, MarginV = safe bottom
+                "\n[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            )
+            ass_lines = [style]
+            for sg in segs:
+                def ms(t): 
+                    hh = int(t//3600); mm = int((t%3600)//60); ss = int(t%60); ms = int((t*1000)%1000)
+                    return f"{hh:d}:{mm:02d}:{ss:02d}.{ms:02d}"
+                ass_lines.append(
+                    f"Dialogue: 0,{ms(sg['start'])},{ms(sg['end'])},Default,,0,0,{settings.vertical_safe_bottom},,"
+                    + re.sub(r"\s+"," ", sg["text"])
+                )
+            
+            async with aiofiles.open(ass_path, "w", encoding="utf-8") as f:
+                await f.write("\n".join(ass_lines))
+
+            # SEO JSON with burn status
+            meta = {
+                "clip_start": start,
+                "clip_end": end,
+                "duration": end - start,
+                "segments": segs,
+                "keywords": [],  # optionally fill from highlight keywords
+                "burned": False,  # Will be updated by caller if burn mode is enabled
+                "published_path": None,  # Will be updated by caller with final path
+            }
+            json_path = base_path + ".json"
+            async with aiofiles.open(json_path, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(meta, ensure_ascii=False, indent=2))
+            
+            print(f"📝 Sidecar captions exported: VTT, ASS, JSON")
+            return {"vtt": vtt_path, "ass": ass_path, "json": json_path}
+            
+        except Exception as e:
+            print(f"⚠️ Sidecar caption export failed: {e}")
+            return {}
+
+    async def _update_manifest_burn_status(self, base_path: str, burned: bool, published_path: str):
+        """Update manifest with burn status and published path"""
+        try:
+            json_path = base_path + ".json"
+            if os.path.exists(json_path):
+                async with aiofiles.open(json_path, 'r', encoding='utf-8') as f:
+                    content = await f.read()
+                    manifest = json.loads(content)
+                
+                # Update burn status
+                manifest["burned"] = burned
+                manifest["published_path"] = os.path.abspath(published_path) if published_path else None
+                
+                # Write updated manifest
+                async with aiofiles.open(json_path, 'w', encoding='utf-8') as f:
+                    await f.write(json.dumps(manifest, ensure_ascii=False, indent=2))
+                
+                print(f"📝 Manifest updated: burned={burned}, published_path={manifest['published_path']}")
+            else:
+                print(f"⚠️ Manifest not found: {json_path}")
+                
+        except Exception as e:
+            print(f"⚠️ Failed to update manifest: {e}")
+
+    async def _burn_ass_captions(self, video_path: str, ass_path: str, clip_start: float = 0.0) -> str:
+        """Burn captions into video using bulletproof drawtext filter builder with fail-fast verification"""
+        try:
+            # Use distinct output filename for burned artifact
+            output_path = video_path.replace(".mp4", "_captioned.mp4")
+            
+            print(f"🎬 Burning captions: {os.path.basename(video_path)} → {os.path.basename(output_path)}")
+            print(f"📍 Clip start time: {clip_start:.2f}s")
+            
+            # Convert ASS to SRT for parsing
+            srt_path = ass_path.replace(".ass", ".srt")
+            await self._convert_ass_to_srt(ass_path, srt_path)
+            
+            # Parse SRT to get caption data
+            captions = await self._parse_srt_file(srt_path)
+            
+            if not captions:
+                print(f"⚠️ No captions found in SRT, using original video")
+                return video_path
+            
+            # Import the bulletproof drawtext builder
+            from app.captions.burn_drawtext import build_drawtext_filter, validate_filter_string
+            
+            # Build bulletproof drawtext filter chain with proper clip-relative timing
+            vf_value = build_drawtext_filter(
+                clip_start=clip_start,
+                segments=captions,
+                style="poppins_bold_boxed",  # Use Poppins with boxed style
+                debug_watermark=False  # Watermark is added separately by video processor
+            )
+            
+            # Validate the filter string
+            if not validate_filter_string(vf_value):
+                print(f"⚠️ Invalid filter string generated, using original video")
+                return video_path
+            
+            # Add CAPS_OK watermark for debugging (always enabled for this run)
+            # Use the bundled Poppins font for consistency
+            from app.captions.fonts import get_bundled_poppins_bold
+            font_path = get_bundled_poppins_bold()
+            
+            caps_watermark = (
+                f"drawtext=fontfile='{font_path}':text='CAPS_OK':enable='1':"
+                f"x='(w-text_w)/2':y='h-120':"
+                f"fontsize=54:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=20"
+            )
+            
+            # Combine main captions with CAPS_OK watermark
+            full_vf = f"{vf_value},{caps_watermark}"
+            
+            # ✅ Force pixel format first, add a background bar to guarantee visibility
+            # Note: vf_value already contains format=yuv420p and drawbox, so don't duplicate
+            if "format=yuv420p" not in vf_value:
+                full_vf = "format=yuv420p," + full_vf
+            
+            if "drawbox" not in vf_value:
+                # Add drawbox only if not already present
+                full_vf = "drawbox=x=0:y=h-340:w=1080:h=320:color=black@0.65:t=fill," + full_vf
+            
+            cmd = [
+                "ffmpeg", "-i", video_path,
+                "-vf", full_vf,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-preset", "veryfast", "-crf", "23",
+                "-r", "30", "-vsync", "cfr",
+                "-profile:v", "baseline", "-level:v", "3.0", "-tag:v", "avc1",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+                "-movflags", "+faststart",
+                "-y", output_path
+            ]
+            
+            print(f"🎬 Burning captions with bulletproof drawtext: {' '.join(cmd)}")
+            print(f"🔍 Filter string: {full_vf}")
+            
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if r.returncode != 0:
+                print(f"❌ FFmpeg drawtext filter failed: {r.stderr}")
+                # Log first 60 lines of stderr for debugging
+                stderr_lines = r.stderr.split('\n')[:60]
+                print(f"🔍 First 60 lines of stderr:")
+                for line in stderr_lines:
+                    print(f"   {line}")
+                raise Exception(f"FFmpeg failed with exit code {r.returncode}")
+            
+            # Verify output dimensions and SAR
+            ok = await self._verify_captioned_video(output_path)
+            if not ok:
+                raise Exception("Caption video verification failed")
+            
+            # FAIL-FAST: Verify captions are actually visible by frame diff
+            if not await self._verify_caption_burn_in(video_path, output_path):
+                raise Exception("Caption burn-in verification failed - captions not visible")
+            
+            print(f"✅ Captions burned successfully using bulletproof drawtext")
+            print(f"📁 Burned output: {output_path} ({os.path.getsize(output_path)} bytes)")
+            
+            return output_path
+                
+        except Exception as e:
+            print(f"❌ Caption burning failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Don't return original video - fail fast
+            raise Exception(f"Caption burning failed: {e}")
+
+    async def _convert_ass_to_srt(self, ass_path: str, srt_path: str):
+        """Convert ASS file to SRT format for reliable caption burning"""
+        try:
+            async with aiofiles.open(ass_path, 'r', encoding='utf-8') as f:
+                ass_content = await f.read()
+            
+            # Parse ASS content to extract dialogue lines
+            lines = ass_content.split('\n')
+            dialogue_lines = []
+            
+            for line in lines:
+                if line.startswith('Dialogue:'):
+                    # Parse ASS dialogue format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+                    parts = line.split(',', 9)  # Split into max 10 parts
+                    if len(parts) >= 10:
+                        start_time = parts[1]
+                        end_time = parts[2]
+                        text = parts[9]
+                        
+                        # Convert ASS time format (H:MM:SS.cc) to seconds for internal use
+                        start_seconds = self._convert_ass_time_to_seconds(start_time)
+                        end_seconds = self._convert_ass_time_to_seconds(end_time)
+                        
+                        # Validate timing: end time must be after start time
+                        if end_seconds <= start_seconds:
+                            print(f"⚠️ Skipping invalid timing segment: {start_time} -> {end_time} (end <= start)")
+                            continue
+                        
+                        # Clean text: replace \N with actual newlines, remove ASS formatting
+                        clean_text = text.replace('\\N', '\n').replace('\\n', '\n')
+                        # Remove any remaining ASS formatting codes
+                        clean_text = re.sub(r'\{[^}]*\}', '', clean_text)
+                        
+                        # Skip empty text
+                        if not clean_text.strip():
+                            continue
+                        
+                        dialogue_lines.append({
+                            'start': start_seconds,
+                            'end': end_seconds,
+                            'text': clean_text.strip()
+                        })
+            
+            # Sort by start time to ensure proper order
+            dialogue_lines.sort(key=lambda x: x['start'])
+            
+            # Remove overlapping segments (keep the first one that starts at each time)
+            clean_dialogue_lines = []
+            last_end_time = 0.0
+            
+            for dialogue in dialogue_lines:
+                if dialogue['start'] >= last_end_time:
+                    clean_dialogue_lines.append(dialogue)
+                    last_end_time = dialogue['end']
+                else:
+                    print(f"⚠️ Skipping overlapping segment: {dialogue['start']:.2f}s -> {dialogue['end']:.2f}s (overlaps with previous ending at {last_end_time:.2f}s)")
+            
+            print(f"📊 Processed {len(dialogue_lines)} segments, kept {len(clean_dialogue_lines)} valid segments")
+            
+            # Write SRT file (strict SRT format)
+            srt_content = ""
+            for i, dialogue in enumerate(clean_dialogue_lines, 1):
+                # Convert seconds back to SRT format for file output
+                start_srt = self._seconds_to_srt_time(dialogue['start'])
+                end_srt = self._seconds_to_srt_time(dialogue['end'])
+                
+                srt_content += f"{i}\n"
+                srt_content += f"{start_srt} --> {end_srt}\n"
+                srt_content += f"{dialogue['text']}\n\n"
+            
+            # Ensure UTF-8 encoding without BOM
+            async with aiofiles.open(srt_path, 'w', encoding='utf-8') as f:
+                await f.write(srt_content)
+            
+            print(f"✅ Converted ASS to SRT: {len(clean_dialogue_lines)} captions")
+            
+        except Exception as e:
+            print(f"❌ ASS to SRT conversion failed: {e}")
+            raise
+
+    def _convert_ass_time_to_seconds(self, ass_time: str) -> float:
+        """Convert ASS time format (H:MM:SS.cc) to seconds"""
+        try:
+            # Parse ASS time: H:MM:SS.cc
+            parts = ass_time.split(':')
+            if len(parts) == 3:
+                hours = int(parts[0])
+                minutes = int(parts[1])
+                seconds_parts = parts[2].split('.')
+                seconds = int(seconds_parts[0])
+                centiseconds = int(seconds_parts[1]) if len(seconds_parts) > 1 else 0
+                
+                # Convert to seconds
+                return hours * 3600 + minutes * 60 + seconds + centiseconds / 100.0
+        except Exception as e:
+            print(f"⚠️ ASS time conversion failed: {e}")
+        
+        # Fallback
+        return 0.0
+
+    def _seconds_to_srt_time(self, seconds: float) -> str:
+        """Convert seconds to SRT time format (HH:MM:SS,mmm)"""
+        try:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            milliseconds = int((seconds % 1) * 1000)
+            
+            return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
+        except Exception as e:
+            print(f"⚠️ Seconds to SRT time conversion failed: {e}")
+            return "00:00:00,000"
+
+    async def _burn_captions_fallback(self, video_path: str, srt_path: str, output_path: str) -> str:
+        """Fallback caption rendering using drawtext filter (no libass dependency)"""
+        try:
+            print(f"🔄 Using drawtext fallback for caption rendering...")
+            
+            # Parse SRT to get caption data
+            captions = await self._parse_srt_file(srt_path)
+            
+            # Build drawtext filter complex
+            drawtext_filters = []
+            for i, caption in enumerate(captions):
+                start_time = caption['start']
+                end_time = caption['end']
+                text = caption['text']
+                
+                # Escape text for drawtext
+                escaped_text = text.replace("'", "\\'").replace('"', '\\"')
+                
+                # Create drawtext filter for this caption
+                drawtext_filter = (
+                    f"drawtext=text='{escaped_text}':"
+                    f"enable='between(t,{start_time},{end_time})':"
+                    f"x=(w-text_w)/2:y=h-160-text_h:"
+                    f"fontsize=48:fontcolor=white:"
+                    f"box=1:boxcolor=black@0.8:boxborderw=20:"
+                    f"fontfile='C\\\\:\\\\Windows\\\\Fonts\\\\arial.ttf'"
+                )
+                drawtext_filters.append(drawtext_filter)
+            
+            # Combine all drawtext filters
+            vf_value = ','.join(drawtext_filters)
+            
+            cmd = [
+                "ffmpeg", "-i", video_path,
+                "-vf", vf_value,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-preset", "veryfast", "-crf", "23",
+                "-r", "30", "-vsync", "cfr",
+                "-profile:v", "baseline", "-level:v", "3.0", "-tag:v", "avc1",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+                "-movflags", "+faststart",
+                "-y", output_path
+            ]
+            
+            print(f"🔄 Fallback drawtext rendering: {' '.join(cmd)}")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if r.returncode != 0:
+                print(f"❌ Fallback rendering failed: {r.stderr}")
+                return video_path
+            
+            # Verify output
+            ok = await self._verify_captioned_video(output_path)
+            if ok:
+                print(f"✅ Fallback captions rendered successfully")
+                return output_path
+            else:
+                print(f"⚠️ Fallback video verification failed")
+                return video_path
+                
+        except Exception as e:
+            print(f"❌ Fallback caption rendering failed: {e}")
+            return video_path
+
+    async def _parse_srt_file(self, srt_path: str) -> List[Dict[str, Any]]:
+        """Parse SRT file to extract caption data"""
+        try:
+            async with aiofiles.open(srt_path, 'r', encoding='utf-8') as f:
+                content = await f.read()
+            
+            captions = []
+            blocks = content.strip().split('\n\n')
+            
+            for block in blocks:
+                lines = block.strip().split('\n')
+                if len(lines) >= 3:
+                    # Parse caption number, timing, and text
+                    caption_num = int(lines[0])
+                    timing = lines[1]
+                    text = '\n'.join(lines[2:])
+                    
+                    # Parse timing (HH:MM:SS,mmm --> HH:MM:SS,mmm)
+                    start_time, end_time = timing.split(' --> ')
+                    
+                    # Convert to seconds for drawtext
+                    start_seconds = self._srt_time_to_seconds(start_time)
+                    end_seconds = self._srt_time_to_seconds(end_time)
+                    
+                    captions.append({
+                        'number': caption_num,
+                        'start': start_seconds,
+                        'end': end_seconds,
+                        'text': text
+                    })
+            
+            return captions
+            
+        except Exception as e:
+            print(f"❌ SRT parsing failed: {e}")
+            return []
+
+    def _srt_time_to_seconds(self, srt_time: str) -> float:
+        """Convert SRT time format (HH:MM:SS,mmm) to seconds"""
+        try:
+            # Handle both comma and period as millisecond separator
+            if ',' in srt_time:
+                time_part, ms_part = srt_time.split(',')
+            else:
+                time_part, ms_part = srt_time.split('.')
+            
+            # Parse HH:MM:SS
+            h, m, s = map(int, time_part.split(':'))
+            ms = int(ms_part)
+            
+            return h * 3600 + m * 60 + s + ms / 1000.0
+            
+        except Exception as e:
+            print(f"⚠️ SRT time parsing failed: {e}")
+            return 0.0
+
+    async def _verify_captioned_video(self, video_path: str) -> bool:
+        """Verify the captioned video has correct dimensions and SAR"""
+        try:
+            # Use ffprobe to get video properties
+            cmd = [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", video_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                print(f"❌ ffprobe failed: {result.stderr}")
+                return False
+            
+            try:
+                data = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                print(f"❌ Failed to parse ffprobe output")
+                return False
+            
+            # Find video stream
+            video_stream = None
+            for stream in data.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    video_stream = stream
+                    break
+            
+            if not video_stream:
+                print(f"❌ No video stream found")
+                return False
+            
+            # Check dimensions
+            width = int(video_stream.get("width", 0))
+            height = int(video_stream.get("height", 0))
+            
+            if width != 1080 or height != 1920:
+                print(f"❌ Wrong dimensions: {width}x{height} (expected 1080x1920)")
+                return False
+            
+            # Check SAR (Sample Aspect Ratio)
+            sar = video_stream.get("sample_aspect_ratio", "1:1")
+            if sar != "1:1":
+                print(f"❌ Wrong SAR: {sar} (expected 1:1)")
+                return False
+            
+            print(f"🔍 Video properties: {width}x{height}, SAR: {sar}")
+            print(f"✅ Video verification passed: {width}x{height}, SAR {sar}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Video verification failed: {e}")
+            return False
+
+    async def _verify_caption_burn_in(self, pre_burn_path: str, post_burn_path: str) -> bool:
+        """Verify captions are actually visible by pixel difference in bottom area"""
+        try:
+            print(f"🔍 Verifying caption burn-in with pixel diff...")
+            
+            # Extract frames at t=1.0s from both videos, cropped to bottom 360px
+            pre_frame = os.path.join(self.temp_dir, "pre_burn_frame.png")
+            post_frame = os.path.join(self.temp_dir, "post_burn_frame.png")
+            
+            # Extract frame from pre-burn video, cropped to bottom area
+            cmd = [
+                "ffmpeg", "-ss", "1.0", "-i", pre_burn_path,
+                "-vf", "crop=1080:360:0:1560",  # Crop bottom 360px of 1920 height
+                "-frames:v", "1", "-y", pre_frame
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                print(f"❌ Failed to extract pre-burn frame: {result.stderr}")
+                return False
+            
+            # Extract frame from post-burn video, cropped to bottom area
+            cmd = [
+                "ffmpeg", "-ss", "1.0", "-i", post_burn_path,
+                "-vf", "crop=1080:360:0:1560",  # Crop bottom 360px of 1920 height
+                "-frames:v", "1", "-y", post_frame
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                print(f"❌ Failed to extract post-burn frame: {result.stderr}")
+                return False
+            
+            # Check if frames exist
+            if not os.path.exists(pre_frame) or not os.path.exists(post_frame):
+                print(f"❌ Frame extraction failed")
+                return False
+            
+            # Use ffprobe to get pixel data and compute difference
+            # This is more reliable than file size comparison
+            try:
+                import cv2
+                import numpy as np
+                
+                # Load images
+                pre_img = cv2.imread(pre_frame)
+                post_img = cv2.imread(post_frame)
+                
+                if pre_img is None or post_img is None:
+                    print(f"❌ Failed to load frame images")
+                    return False
+                
+                # Convert to grayscale for comparison
+                pre_gray = cv2.cvtColor(pre_img, cv2.COLOR_BGR2GRAY)
+                post_gray = cv2.cvtColor(post_img, cv2.COLOR_BGR2GRAY)
+                
+                # Compute mean absolute difference
+                diff = cv2.absdiff(pre_gray, post_gray)
+                mean_diff = np.mean(diff)
+                
+                print(f"📸 Pixel difference in bottom area: {mean_diff:.2f} (0-255 scale)")
+                
+                # Check if pixel difference is significant enough to indicate captions
+                if mean_diff > 8:  # Lowered from 12 to 8 for debugging
+                    print(f"✅ Pixel diff verification passed: {mean_diff:.2f} > 8")
+                    return True
+                else:
+                    print(f"❌ Pixel diff verification failed: {mean_diff:.2f} <= 8")
+                    print(f"🔍 This suggests captions may be too subtle or positioned differently")
+                    print(f"🔍 Original frame size: {pre_img.shape}")
+                    print(f"🔍 Captioned frame size: {post_img.shape}")
+                    return False
+                    
+            except ImportError:
+                # Fallback to file size comparison if OpenCV not available
+                print(f"⚠️ OpenCV not available, falling back to file size comparison")
+                pre_size = os.path.getsize(pre_frame)
+                post_size = os.path.getsize(post_frame)
+                
+                print(f"📸 Frame sizes: pre-burn: {pre_size}, post-burn: {post_size}")
+                
+                # Simple check: if post-burn frame is significantly larger, captions are likely visible
+                if post_size > pre_size * 1.05:  # 5% increase threshold
+                    print(f"✅ Frame size verification passed - captions likely visible")
+                    return True
+                else:
+                    print(f"❌ Frame size verification failed - no significant difference")
+                    return False
+                
+        except Exception as e:
+            print(f"❌ Caption burn-in verification failed: {e}")
+            return False

@@ -1,26 +1,35 @@
 import { useState, useRef } from 'react';
-import { Upload, Link, Video, FileVideo } from 'lucide-react';
-import { VideoInputFormProps } from '../types';
-import axios from 'axios';
+import { Upload, Youtube, Play, Download, FileVideo } from 'lucide-react';
+
+interface VideoInputFormProps {
+  onProcessingStart: (requestId: string) => void;
+}
 
 const VideoInputForm: React.FC<VideoInputFormProps> = ({ onProcessingStart }) => {
-  const [inputMethod, setInputMethod] = useState<'youtube' | 'file'>('youtube');
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [dragActive, setDragActive] = useState(false);
-  const [addCaptions, setAddCaptions] = useState(true); // Default to true for gaming clips
+  const [activeTab, setActiveTab] = useState<'youtube' | 'upload'>('youtube');
+  const [addCaptions, setAddCaptions] = useState(true);
+  const [captionMode, setCaptionMode] = useState<'burn' | 'sidecar' | 'off'>('sidecar');
+  const [userTopics, setUserTopics] = useState('');
+  const [vertical, setVertical] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] || null;
+    setSelectedFile(file);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     
-    if (inputMethod === 'youtube' && !youtubeUrl.trim()) {
+    if (activeTab === 'youtube' && !youtubeUrl.trim()) {
       alert('Please enter a YouTube URL');
       return;
     }
     
-    if (inputMethod === 'file' && !selectedFile) {
+    if (activeTab === 'upload' && !selectedFile) {
       alert('Please select a video file');
       return;
     }
@@ -30,24 +39,40 @@ const VideoInputForm: React.FC<VideoInputFormProps> = ({ onProcessingStart }) =>
     try {
       const formData = new FormData();
       
-      if (inputMethod === 'youtube') {
-        formData.append('youtube_url', youtubeUrl);
+      if (activeTab === 'youtube') {
+        formData.append('youtube_url', youtubeUrl.trim());
       } else {
         formData.append('video_file', selectedFile!);
       }
       
-      // Add caption preference
       formData.append('add_captions', addCaptions.toString());
+      formData.append('caption_mode', captionMode);
+      if (userTopics.trim()) {
+        formData.append('user_topics', userTopics.trim());
+      }
+      formData.append('vertical', vertical.toString());
 
-      const response = await axios.post('/api/v1/process-video', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
+      const response = await fetch('/api/v1/process-video', {
+        method: 'POST',
+        body: formData,
       });
 
-      if (response.data.request_id) {
-        onProcessingStart(response.data.request_id);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
+
+      const data = await response.json();
+      console.log('Processing started:', data);
+      
+      onProcessingStart(data.request_id);
+      
+      // Reset form
+      setYoutubeUrl('');
+      setSelectedFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      
     } catch (error) {
       console.error('Error starting processing:', error);
       alert('Failed to start video processing. Please try again.');
@@ -56,87 +81,91 @@ const VideoInputForm: React.FC<VideoInputFormProps> = ({ onProcessingStart }) =>
     }
   };
 
-  const handleFileSelect = (file: File) => {
-    // Validate file type
-    const validTypes = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv'];
-    const fileExtension = '.' + file.name.split('.').pop()?.toLowerCase();
-    
-    if (!validTypes.includes(fileExtension)) {
-      alert('Please select a valid video file format (MP4, AVI, MOV, MKV, WMV, FLV)');
-      return;
+  const handleTabChange = (tab: 'youtube' | 'upload') => {
+    setActiveTab(tab);
+    // Reset form when switching tabs
+    setYoutubeUrl('');
+    setSelectedFile(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
     }
-
-    // Validate file size (500MB limit)
-    if (file.size > 500 * 1024 * 1024) {
-      alert('File size must be less than 500MB');
-      return;
-    }
-
-    setSelectedFile(file);
-  };
-
-  const handleDrag = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.type === 'dragenter' || e.type === 'dragover') {
-      setDragActive(true);
-    } else if (e.type === 'dragleave') {
-      setDragActive(false);
-    }
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragActive(false);
-    
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleFileSelect(e.dataTransfer.files[0]);
-    }
-  };
-
-  const openFileDialog = () => {
-    fileInputRef.current?.click();
   };
 
   return (
     <div className="card">
-      <div className="text-center mb-6">
-        <h2 className="text-2xl font-bold text-gray-900 mb-2">
-          Generate Video Highlights
-        </h2>
-        <p className="text-gray-600">
-          Choose your input method and let AI create engaging highlight clips
-        </p>
+      <div className="card-header">
+        <h2 className="text-2xl font-bold text-gray-900 mb-2">🎬 ClipGenius</h2>
+        <p className="text-gray-600">Transform your videos into engaging short-form content</p>
       </div>
 
-      {/* Input Method Tabs */}
-      <div className="flex mb-6 bg-gray-100 rounded-lg p-1">
+      {/* Tab Navigation */}
+      <div className="flex space-x-1 bg-gray-100 p-1 rounded-lg mb-6">
         <button
-          onClick={() => setInputMethod('youtube')}
-          className={`flex-1 flex items-center justify-center py-2 px-4 rounded-md transition-colors ${
-            inputMethod === 'youtube'
-              ? 'bg-white text-primary-600 shadow-sm'
+          type="button"
+          onClick={() => handleTabChange('youtube')}
+          className={`flex-1 py-2 px-4 rounded-md text-sm font-medium transition-colors ${
+            activeTab === 'youtube'
+              ? 'bg-white text-blue-600 shadow-sm'
               : 'text-gray-600 hover:text-gray-900'
           }`}
         >
-          <Link className="w-4 h-4 mr-2" />
+          <Youtube className="w-4 h-4 inline mr-2" />
           YouTube URL
         </button>
         <button
-          onClick={() => setInputMethod('file')}
-          className={`flex-1 flex items-center justify-center py-2 px-4 rounded-md transition-colors ${
-            inputMethod === 'file'
-              ? 'bg-white text-primary-600 shadow-sm'
+          type="button"
+          onClick={() => handleTabChange('upload')}
+          className={`flex-1 py-2 px-4 rounded-md text-sm font-medium transition-colors ${
+            activeTab === 'upload'
+              ? 'bg-white text-blue-600 shadow-sm'
               : 'text-gray-600 hover:text-gray-900'
           }`}
         >
-          <Upload className="w-4 h-4 mr-2" />
+          <Upload className="w-4 h-4 inline mr-2" />
           Upload File
         </button>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-6">
+        {/* YouTube URL Input */}
+        {activeTab === 'youtube' && (
+          <div className="space-y-2">
+            <label htmlFor="youtubeUrl" className="block text-sm font-medium text-gray-700">
+              YouTube Video URL
+            </label>
+            <input
+              type="url"
+              id="youtubeUrl"
+              value={youtubeUrl}
+              onChange={(e) => setYoutubeUrl(e.target.value)}
+              placeholder="https://www.youtube.com/watch?v=..."
+              className="input-field"
+              required
+            />
+          </div>
+        )}
+
+        {/* File Upload Input */}
+        {activeTab === 'upload' && (
+          <div className="space-y-2">
+            <label htmlFor="videoFile" className="block text-sm font-medium text-gray-700">
+              Video File
+            </label>
+            <input
+              ref={fileInputRef}
+              type="file"
+              id="videoFile"
+              accept="video/*"
+              onChange={handleFileSelect}
+              className="input-field"
+              required
+            />
+            <p className="text-sm text-gray-500">
+              Supported formats: MP4, MOV, AVI, MKV (Max 500MB)
+            </p>
+          </div>
+        )}
+
         {/* Caption Toggle */}
         <div className="bg-blue-50 p-4 rounded-lg border border-blue-200">
           <div className="flex items-center space-x-3">
@@ -145,146 +174,122 @@ const VideoInputForm: React.FC<VideoInputFormProps> = ({ onProcessingStart }) =>
               id="addCaptions"
               checked={addCaptions}
               onChange={(e) => setAddCaptions(e.target.checked)}
-              className="w-4 h-4 text-primary-600 bg-gray-100 border-gray-300 rounded focus:ring-primary-500 focus:ring-2"
+              className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 focus:ring-2"
             />
             <label htmlFor="addCaptions" className="text-sm font-medium text-blue-900">
-              Add Captions to Clips
+              📝 Add Captions to Clips
             </label>
           </div>
           <p className="text-sm text-blue-700 mt-1 ml-7">
-            Burn captions directly into the video for better accessibility and social media sharing
+            Automatically generate and burn in captions from the video transcript
+          </p>
+          
+          {/* Caption Mode Selector */}
+          {addCaptions && (
+            <div className="mt-3 ml-7">
+              <label htmlFor="captionMode" className="block text-sm font-medium text-blue-800 mb-2">
+                Caption Style:
+              </label>
+              <select
+                id="captionMode"
+                value={captionMode}
+                onChange={(e) => setCaptionMode(e.target.value as 'burn' | 'sidecar' | 'off')}
+                className="block w-full px-3 py-2 border border-blue-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              >
+                <option value="sidecar">📄 Sidecar (VTT/ASS/JSON) - Export files for later styling</option>
+                <option value="burn">🔥 Burn In - Captions embedded in video</option>
+                <option value="off">❌ No Captions - Just the video</option>
+              </select>
+              <p className="text-xs text-blue-600 mt-1">
+                {captionMode === 'sidecar' && "Exports WebVTT, ASS, and JSON files for SEO and design flexibility"}
+                {captionMode === 'burn' && "Captions are permanently embedded in the video with mobile-safe positioning"}
+                {captionMode === 'off' && "No caption files generated"}
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* User Topics Input */}
+        <div className="bg-green-50 p-4 rounded-lg border border-green-200">
+          <label htmlFor="userTopics" className="block text-sm font-medium text-green-900 mb-2">
+            🎯 Find Clips About (Optional)
+          </label>
+          <input
+            type="text"
+            id="userTopics"
+            value={userTopics}
+            onChange={(e) => setUserTopics(e.target.value)}
+            placeholder="e.g., pricing, onboarding, features (comma-separated)"
+            className="input-field w-full"
+          />
+          <p className="text-sm text-green-700 mt-1">
+            Leave empty to use AI highlight detection, or specify topics to find specific content
           </p>
         </div>
 
-        {inputMethod === 'youtube' ? (
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              YouTube Video URL
+        {/* Vertical Output Toggle */}
+        <div className="bg-purple-50 p-4 rounded-lg border border-purple-200">
+          <div className="flex items-center space-x-3">
+            <input
+              type="checkbox"
+              id="vertical"
+              checked={vertical}
+              onChange={(e) => setVertical(e.target.checked)}
+              className="w-4 h-4 text-purple-600 bg-gray-100 border-gray-300 rounded focus:ring-purple-500 focus:ring-2"
+            />
+            <label htmlFor="vertical" className="text-sm font-medium text-purple-900">
+              📱 Vertical Output (9:16)
             </label>
-            <div className="flex space-x-3">
-              <input
-                type="url"
-                value={youtubeUrl}
-                onChange={(e) => setYoutubeUrl(e.target.value)}
-                placeholder="https://www.youtube.com/watch?v=..."
-                className="input-field flex-1"
-                required
-              />
-              <button
-                type="submit"
-                disabled={isProcessing || !youtubeUrl.trim()}
-                className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {isProcessing ? 'Processing...' : 'Process Video'}
-              </button>
-            </div>
-            <p className="text-sm text-gray-500 mt-2">
-              Enter a YouTube video URL (you must own the video or have rights to use it)
-            </p>
           </div>
-        ) : (
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Upload Video File
-            </label>
-            
-            <div
-              className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
-                dragActive
-                  ? 'border-primary-400 bg-primary-50'
-                  : 'border-gray-300 hover:border-gray-400'
-              }`}
-              onDragEnter={handleDrag}
-              onDragLeave={handleDrag}
-              onDragOver={handleDrag}
-              onDrop={handleDrop}
-            >
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="video/*"
-                onChange={(e) => e.target.files?.[0] && handleFileSelect(e.target.files[0])}
-                className="hidden"
-              />
-              
-              {selectedFile ? (
-                <div className="space-y-3">
-                  <FileVideo className="w-12 h-12 text-primary-500 mx-auto" />
-                  <div>
-                    <p className="font-medium text-gray-900">{selectedFile.name}</p>
-                    <p className="text-sm text-gray-500">
-                      {(selectedFile.size / (1024 * 1024)).toFixed(2)} MB
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedFile(null)}
-                    className="text-sm text-red-600 hover:text-red-700"
-                  >
-                    Remove file
-                  </button>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  <Upload className="w-12 h-12 text-gray-400 mx-auto" />
-                  <div>
-                    <p className="font-medium text-gray-900">
-                      Drop your video file here, or{' '}
-                      <button
-                        type="button"
-                        onClick={openFileDialog}
-                        className="text-primary-600 hover:text-primary-700 underline"
-                      >
-                        browse
-                      </button>
-                    </p>
-                    <p className="text-sm text-gray-500">
-                      Supports MP4, AVI, MOV, MKV, WMV, FLV (max 500MB)
-                    </p>
-                  </div>
-                </div>
-              )}
-            </div>
+          <p className="text-sm text-purple-700 mt-1 ml-7">
+            Generate clips in vertical format optimized for TikTok, Instagram Reels, and YouTube Shorts
+          </p>
+        </div>
 
-            {selectedFile && (
-              <div className="mt-4 text-center">
-                <button
-                  type="submit"
-                  disabled={isProcessing}
-                  className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {isProcessing ? 'Processing...' : 'Process Video'}
-                </button>
-              </div>
-            )}
-          </div>
-        )}
+        {/* Submit Button */}
+        <button
+          type="submit"
+          disabled={isProcessing}
+          className="w-full bg-blue-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {isProcessing ? (
+            <span className="flex items-center justify-center">
+              <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>
+              Processing...
+            </span>
+          ) : (
+            <span className="flex items-center justify-center">
+              <Play className="w-5 h-5 mr-2" />
+              Generate Clips
+            </span>
+          )}
+        </button>
       </form>
 
       {/* Features Preview */}
-      <div className="mt-8 pt-6 border-t border-gray-200">
-        <h3 className="text-lg font-semibold text-gray-900 mb-4 text-center">
-          What you'll get:
-        </h3>
+      <div className="mt-8">
+        <h3 className="text-lg font-semibold text-gray-900 mb-4">✨ What You'll Get</h3>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="text-center">
-            <Video className="w-8 h-8 text-primary-500 mx-auto mb-2" />
-            <h4 className="font-medium text-gray-900">AI Transcription</h4>
-            <p className="text-sm text-gray-600">Accurate speech-to-text using OpenAI Whisper</p>
+            <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-2">
+              <span className="text-green-600 text-sm font-bold">🎯</span>
+            </div>
+            <h4 className="font-medium text-gray-900">Topic Search</h4>
+            <p className="text-sm text-gray-600">Find clips about specific topics or keywords</p>
           </div>
           <div className="text-center">
-            <div className="w-8 h-8 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-2">
-              <span className="text-primary-600 text-sm font-bold">✨</span>
+            <div className="w-8 h-8 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-2">
+              <span className="text-purple-600 text-sm font-bold">📱</span>
             </div>
-            <h4 className="font-medium text-gray-900">Smart Highlights</h4>
-            <p className="text-sm text-gray-600">Automatic detection of key moments</p>
+            <h4 className="font-medium text-gray-900">Vertical Format</h4>
+            <p className="text-sm text-gray-600">9:16 aspect ratio for social media</p>
           </div>
           <div className="text-center">
-            <div className="w-8 h-8 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-2">
-              <span className="text-primary-600 text-sm font-bold">📝</span>
+            <div className="w-8 h-8 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-2">
+              <span className="text-orange-600 text-sm font-bold">🔍</span>
             </div>
-            <h4 className="font-medium text-gray-900">Auto Captions</h4>
-            <p className="text-sm text-gray-600">Professional captions burned into clips</p>
+            <h4 className="font-medium text-gray-900">Smart Endings</h4>
+            <p className="text-sm text-gray-600">Clean cuts at natural boundaries</p>
           </div>
         </div>
       </div>

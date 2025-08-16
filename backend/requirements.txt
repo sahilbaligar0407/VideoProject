@@ -11,3 +11,6 @@ python-ffmpeg==2.0.4
 numpy==1.24.3
 librosa==0.10.1
 scipy==1.11.4
+yt-dlp==2023.12.30
+opencv-python==4.8.1.78
+mediapipe==0.10.7

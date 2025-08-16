@@ -9,7 +9,7 @@ from typing import Optional
 import asyncio
 from app.services.video_processor import VideoProcessor
 from app.models import VideoProcessingResponse, ProcessingStatus
-from app.config import settings
+from app.settings import settings
 import json
 
 router = APIRouter()
@@ -22,21 +22,43 @@ async def process_video(
     background_tasks: BackgroundTasks,
     youtube_url: Optional[str] = Form(None),
     video_file: Optional[UploadFile] = File(None),
-    add_captions: Optional[str] = Form("true")
+    add_captions: Optional[str] = Form("true"),
+    caption_mode: Optional[str] = Form("sidecar"),
+    user_topics: Optional[str] = Form(None),
+    vertical: Optional[str] = Form("true")
 ):
-    """Process video from either YouTube URL or file upload"""
+    """Process video from either YouTube URL or file upload with enhanced options"""
     
     # Debug logging
     print(f"🔍 Received request:")
     print(f"  YouTube URL: {youtube_url}")
     print(f"  Video file: {video_file.filename if video_file else 'None'}")
     print(f"  File size: {video_file.size if video_file else 'N/A'}")
+    print(f"  Add captions: {add_captions}")
+    print(f"  Caption mode: {caption_mode}")
+    print(f"  User topics: {user_topics}")
+    print(f"  Vertical output: {vertical}")
     
     if not youtube_url and not video_file:
         raise HTTPException(status_code=400, detail="Either YouTube URL or video file must be provided")
     
     if youtube_url and video_file:
         raise HTTPException(status_code=400, detail="Provide either YouTube URL OR video file, not both")
+    
+    # Parse parameters
+    add_captions_bool = add_captions.lower() == "true" if add_captions else True
+    caption_mode_str = caption_mode if caption_mode else "sidecar"
+    vertical_bool = vertical.lower() == "true" if vertical else True
+    
+    # Parse user topics if provided
+    user_topics_list = None
+    if user_topics:
+        try:
+            user_topics_list = [topic.strip() for topic in user_topics.split(",") if topic.strip()]
+            print(f"🎯 Parsed user topics: {user_topics_list}")
+        except Exception as e:
+            print(f"⚠️ Failed to parse user topics: {e}")
+            user_topics_list = None
     
     # Generate request ID
     request_id = str(uuid.uuid4())
@@ -48,21 +70,27 @@ async def process_video(
         "message": "Starting video processing...",
         "current_step": "initializing",
         "clips": None,
-        "error": None
+        "error": None,
+        "user_topics": user_topics_list,
+        "vertical": vertical_bool,
+        "caption_mode": caption_mode_str
     }
     
     # Start background processing
     if youtube_url:
         print(f"🚀 Starting YouTube processing for request: {request_id}")
-        background_tasks.add_task(process_youtube_video, request_id, youtube_url, add_captions)
+        background_tasks.add_task(process_youtube_video, request_id, youtube_url, add_captions_bool, caption_mode_str, user_topics_list, vertical_bool)
     else:
         print(f"🚀 Starting file upload processing for request: {request_id}")
-        background_tasks.add_task(process_uploaded_video, request_id, video_file, add_captions)
+        background_tasks.add_task(process_uploaded_video, request_id, video_file, add_captions_bool, caption_mode_str, user_topics_list, vertical_bool)
     
     return {
         "request_id": request_id,
         "status": "processing",
-        "message": "Video processing started"
+        "message": "Video processing started",
+        "user_topics": user_topics_list,
+        "vertical": vertical_bool,
+        "caption_mode": caption_mode_str
     }
 
 @router.get("/status/{request_id}")
@@ -113,7 +141,7 @@ async def download_clip(clip_id: str):
     
     if not os.path.exists(clip_path):
         # Try to find the file in the outputs directory
-        from app.config import settings
+        from app.settings import settings
         output_dir = settings.output_dir
         print(f"Searching in output directory: {output_dir}")
         
@@ -147,7 +175,74 @@ async def download_clip(clip_id: str):
     print(f"✅ Returning file response for {clip_path}")
     return response
 
-async def process_youtube_video(request_id: str, youtube_url: str, add_captions: str):
+@router.post("/topic-clips")
+async def generate_topic_clips(
+    background_tasks: BackgroundTasks,
+    video_path: Optional[str] = Form(None),
+    video_id: Optional[str] = Form(None),
+    topics: str = Form(...),
+    add_captions: Optional[str] = Form("true"),
+    max_clips: Optional[int] = Form(5),
+    vertical: Optional[str] = Form("true")
+):
+    """Generate clips based on specific topics from a video"""
+    
+    # Parse parameters
+    add_captions_bool = add_captions.lower() == "true" if add_captions else True
+    vertical_bool = vertical.lower() == "true" if vertical else True
+    
+    # Parse topics
+    try:
+        topics_list = [topic.strip() for topic in topics.split(",") if topic.strip()]
+        print(f"🎯 Topic-based clip generation requested for topics: {topics_list}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid topics format: {e}")
+    
+    if not topics_list:
+        raise HTTPException(status_code=400, detail="At least one topic must be provided")
+    
+    # Validate video source
+    if not video_path and not video_id:
+        raise HTTPException(status_code=400, detail="Either video_path or video_id must be provided")
+    
+    # Generate request ID
+    request_id = str(uuid.uuid4())
+    
+    # Initialize processing status
+    processing_status[request_id] = {
+        "status": "processing",
+        "progress": 0,
+        "message": "Starting topic-based clip generation...",
+        "current_step": "initializing",
+        "clips": None,
+        "error": None,
+        "user_topics": topics_list,
+        "vertical": vertical_bool,
+        "max_clips": max_clips
+    }
+    
+    # Start background processing
+    background_tasks.add_task(
+        process_topic_clips, 
+        request_id, 
+        video_path or video_id, 
+        topics_list, 
+        add_captions_bool, 
+        vertical_bool, 
+        max_clips
+    )
+    
+    return {
+        "request_id": request_id,
+        "status": "processing",
+        "message": "Topic-based clip generation started",
+        "topics": topics_list,
+        "max_clips": max_clips,
+        "vertical": vertical_bool
+    }
+
+
+async def process_youtube_video(request_id: str, youtube_url: str, add_captions: str, caption_mode: str, user_topics: Optional[list], vertical: bool):
     """Process YouTube video with actual download and processing"""
     try:
         # Update status
@@ -165,7 +260,7 @@ async def process_youtube_video(request_id: str, youtube_url: str, add_captions:
         
         # Process the downloaded video
         processor = VideoProcessor()
-        clips = await processor.process_video(video_path, "youtube", add_captions.lower() == "true")
+        clips = await processor.process_video(video_path, "youtube", add_captions, user_topics, vertical, caption_mode)
         
         print(f"Generated {len(clips)} clips from YouTube video")
         
@@ -245,7 +340,7 @@ async def download_youtube_video(request_id: str, youtube_url: str) -> str:
         print(f"❌ YouTube download failed: {e}")
         raise Exception(f"YouTube download failed: {str(e)}")
 
-async def process_uploaded_video(request_id: str, video_file: UploadFile, add_captions: str):
+async def process_uploaded_video(request_id: str, video_file: UploadFile, add_captions: str, caption_mode: str, user_topics: Optional[list], vertical: bool):
     """Process uploaded video file"""
     try:
         # Update status
@@ -283,7 +378,7 @@ async def process_uploaded_video(request_id: str, video_file: UploadFile, add_ca
         
         # Process the video
         processor = VideoProcessor()
-        clips = await processor.process_video(video_path, "file", add_captions.lower() == "true")
+        clips = await processor.process_video(video_path, "file", add_captions, user_topics, vertical, caption_mode)
         
         print(f"Generated {len(clips)} clips")
         
@@ -365,3 +460,72 @@ async def simulate_processing_steps(request_id: str, input_type: str):
     
     processing_status[request_id]["clips"] = placeholder_clips
     processing_status[request_id]["status"] = "completed"
+
+async def process_topic_clips(
+    request_id: str, 
+    video_source: str, 
+    topics: list, 
+    add_captions: bool, 
+    vertical: bool, 
+    max_clips: int
+):
+    """Process topic-based clip generation"""
+    try:
+        # Update status
+        processing_status[request_id]["current_step"] = "processing_topics"
+        processing_status[request_id]["message"] = f"Generating clips for topics: {', '.join(topics)}"
+        
+        # Determine if this is a file path or needs to be found
+        video_path = video_source
+        if not os.path.exists(video_source):
+            # Try to find video by ID in processing status
+            for status in processing_status.values():
+                if status.get("clips"):
+                    for clip in status["clips"]:
+                        if clip.get("clip_id") == video_source:
+                            # Extract from the original video
+                            video_path = clip.get("file_path", "").replace("_captioned.mp4", ".mp4")
+                            break
+        
+        if not os.path.exists(video_path):
+            raise Exception(f"Video not found: {video_source}")
+        
+        # Process the video with topic focus
+        processor = VideoProcessor()
+        clips = await processor.process_video(
+            video_path, 
+            "file", 
+            add_captions, 
+            topics, 
+            vertical
+        )
+        
+        # Limit to requested number of clips
+        if len(clips) > max_clips:
+            clips = clips[:max_clips]
+            print(f"📊 Limited clips to {max_clips} as requested")
+        
+        # Update status
+        processing_status[request_id]["status"] = "completed"
+        processing_status[request_id]["progress"] = 100
+        processing_status[request_id]["message"] = f"Generated {len(clips)} topic-based clips"
+        processing_status[request_id]["clips"] = [
+            {
+                "clip_id": clip.clip_id,
+                "start_time": clip.start_time,
+                "end_time": clip.end_time,
+                "duration": clip.duration,
+                "file_path": clip.file_path,
+                "caption_text": clip.caption_text,
+                "download_url": clip.download_url
+            }
+            for clip in clips
+        ]
+        
+        print(f"✅ Topic-based clip generation completed: {len(clips)} clips")
+        
+    except Exception as e:
+        print(f"❌ Topic-based clip generation failed: {e}")
+        processing_status[request_id]["status"] = "failed"
+        processing_status[request_id]["error"] = str(e)
+        processing_status[request_id]["message"] = f"Topic-based clip generation failed: {str(e)}"

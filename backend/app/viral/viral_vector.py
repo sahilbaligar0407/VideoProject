@@ -9,7 +9,7 @@ from datetime import datetime
 from .embeddings import embed_texts
 from .viral_terms import get_viral_terms
 from .persist import upsert_viral_vector, get_viral_vector_from_db
-from ..config import settings
+from ..settings import settings
 
 
 class ViralVector:

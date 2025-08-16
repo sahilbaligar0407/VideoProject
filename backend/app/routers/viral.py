@@ -17,7 +17,7 @@ from ..viral import (
     create_highlight_segments_from_windows, upsert_viral_scores,
     get_viral_scores, upsert_video_embeddings, get_database_stats
 )
-from ..config import settings
+from ..settings import settings
 
 router = APIRouter(prefix="/api/v1/viral", tags=["viral"])
 

@@ -9,7 +9,7 @@ import numpy as np
 from typing import List, Optional, Tuple
 from datetime import datetime
 
-from ..config import settings
+from ..settings import settings
 
 
 def get_db_path() -> str:

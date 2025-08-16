@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from .embeddings import embed_texts
 from .viral_vector import get_viral_vector
-from ..config import settings
+from ..settings import settings
 
 
 @dataclass

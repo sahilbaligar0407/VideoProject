@@ -7,7 +7,7 @@ import os
 from typing import List, Dict, Optional
 from pydantic import BaseModel, Field
 
-from ..config import settings
+from ..settings import settings
 
 
 class ViralTerm(BaseModel):

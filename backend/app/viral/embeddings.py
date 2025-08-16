@@ -13,7 +13,7 @@ from openai import OpenAI
 import asyncio
 import time
 
-from ..config import settings
+from ..settings import settings
 
 
 class EmbeddingCache:

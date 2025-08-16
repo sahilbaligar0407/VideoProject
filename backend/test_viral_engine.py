@@ -16,7 +16,7 @@ from app.viral import (
     rebuild_viral_vector, window_captions, score_windows_against_viral_vector,
     get_database_stats
 )
-from app.config import settings
+from app.settings import settings
 
 
 async def test_viral_engine():

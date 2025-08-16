@@ -1,0 +1,13 @@
+1
+00:00:00,000 --> 00:00:02,500
+This room is like a red carpet
+Hollywood hallway.
+
+2
+00:00:02,500 --> 00:00:04,500
+I say we go to the movie exhibit next.
+
+3
+00:00:04,500 --> 00:00:06,000
+I see some stars\, where's my name?
+
