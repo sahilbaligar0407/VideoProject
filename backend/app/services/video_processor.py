@@ -1185,7 +1185,7 @@ class VideoProcessor:
                         
                         print(f"📝 ASS file size: {ass_size} bytes")
                         
-                        final_clip_path = await self._burn_ass_captions(clip_path, ass_path, start_time)
+                        final_clip_path = await self._burn_ass_captions(clip_path, ass_path, start_time, clip_id)
                         print(f"🔥 Caption burning returned: {final_clip_path}")
                         
                         # Verify the burned file is different from the original
@@ -1285,24 +1285,25 @@ class VideoProcessor:
             # Use Windows-compatible FFmpeg settings
             cmd = [
                 "ffmpeg",
+                "-i", video_path,
                 "-ss", str(start_time),
                 "-t", str(duration),
-                "-i", video_path,
+                "-avoid_negative_ts", "make_zero",
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-preset", "veryfast",
                 "-crf", "23",
-                "-r", "30",  # Force 30fps for compatibility
-                "-vsync", "cfr",  # Force constant frame rate
+                "-r", "30",
+                "-vsync", "cfr",
                 "-profile:v", "baseline",
                 "-level:v", "3.0",
-                "-tag:v", "avc1",  # Windows-friendly codec tag
+                "-tag:v", "avc1",
                 "-c:a", "aac",
                 "-b:a", "128k",
                 "-ar", "48000",
                 "-ac", "2",
-                "-movflags", "+faststart",  # Enable streaming
-                "-y",  # Overwrite output
+                "-movflags", "+faststart",
+                "-y",
                 output_path
             ]
             
@@ -1806,6 +1807,10 @@ class VideoProcessor:
         """
         import re  # ensures available even if file-level import ever changes
         try:
+            # Apply caption lead-in timing (fixes Whisper's natural lag ~120-220ms)
+            lead = getattr(settings, "caption_lead_sec", 0.18)
+            min_dur = getattr(settings, "min_caption_dur", 0.12)
+            
             segs = []
             for seg in getattr(transcription, "segments", []) or []:
                 s, e = seg.get("start"), seg.get("end")
@@ -1813,13 +1818,24 @@ class VideoProcessor:
                     continue
                 if e <= start or s >= end:
                     continue
-                # Clamp to clip range
+                # Apply lead-in and ensure clip-relative timing
+                start_relative = max(0.0, (s - start) - lead)
+                end_relative = max(0.01, (e - start) - lead)
+                
                 segs.append({
-                    "start": max(0.0, s - start),
-                    "end":   max(0.01, e - start),
+                    "start": start_relative,
+                    "end": end_relative,
                     "text": (seg.get("text") or "").strip()
                 })
-
+            
+            # Enforce minimum on-screen time & monotonicity
+            for sg in segs:
+                if sg["end"] - sg["start"] < min_dur:
+                    sg["end"] = min(sg["start"] + min_dur, (end - start))
+            
+            # Ensure segments are in chronological order
+            segs.sort(key=lambda x: x["start"])
+            
             # WebVTT
             vtt_path = base_path + ".vtt"
             vtt_lines = ["WEBVTT\n"]
@@ -1860,6 +1876,9 @@ class VideoProcessor:
                     f"Dialogue: 0,{ms(sg['start'])},{ms(sg['end'])},Default,,0,0,{settings.vertical_safe_bottom},,"
                     + re.sub(r"\s+"," ", sg["text"])
                 )
+            
+            # Add trailing newline for proper file formatting
+            ass_lines.append("")
             
             async with aiofiles.open(ass_path, "w", encoding="utf-8") as f:
                 await f.write("\n".join(ass_lines))
@@ -1909,7 +1928,7 @@ class VideoProcessor:
         except Exception as e:
             print(f"⚠️ Failed to update manifest: {e}")
 
-    async def _burn_ass_captions(self, video_path: str, ass_path: str, clip_start: float = 0.0) -> str:
+    async def _burn_ass_captions(self, video_path: str, ass_path: str, clip_start: float = 0.0, clip_id: str = None) -> str:
         """Burn captions into video using bulletproof drawtext filter builder with fail-fast verification"""
         try:
             # Use distinct output filename for burned artifact
@@ -1929,88 +1948,61 @@ class VideoProcessor:
                 print(f"⚠️ No captions found in SRT, using original video")
                 return video_path
             
-            # Import the bulletproof drawtext builder
-            from app.captions.burn_drawtext import build_drawtext_filter, validate_filter_string
+            # Use MoviePy-based caption system for reliable caption generation
+            from app.captions.moviepy_captions import process_video_with_captions
             
-            # Build bulletproof drawtext filter chain with proper clip-relative timing
-            # Note: SRT parser already returns clip-relative times, so pass clip_start=0.0
-            vf_value = build_drawtext_filter(
-                clip_start=0.0,  # ← Stop subtracting twice - SRT times are already clip-relative
-                segments=captions,
-                style="poppins_bold_boxed",  # Use Poppins with boxed style
-                debug_watermark=False  # Watermark is added separately by video processor
-            )
+            print(f"🎬 Using MoviePy for reliable caption generation")
             
-            # Validate the filter string
-            if not validate_filter_string(vf_value):
-                print(f"⚠️ Invalid filter string generated, using original video")
+            # Get the original transcription data from the JSON file
+            json_path = ass_path.replace(".ass", ".json")
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        import json
+                        clip_data = json.load(f)
+                    
+                    segments = clip_data.get('segments', [])
+                    if segments:
+                        print(f"📝 Using original transcription data: {len(segments)} segments")
+                        # Convert segments to the format MoviePy expects
+                        transcription_data = []
+                        for segment in segments:
+                            transcription_data.append({
+                                'word': segment['text'],
+                                'start': float(segment['start']),
+                                'end': float(segment['end'])
+                            })
+                    else:
+                        print(f"⚠️ No segments in JSON, falling back to SRT data")
+                        transcription_data = captions
+                except Exception as e:
+                    print(f"⚠️ Error reading JSON, falling back to SRT data: {e}")
+                    transcription_data = captions
+            else:
+                print(f"⚠️ JSON file not found, falling back to SRT data")
+                transcription_data = captions
+            
+            try:
+                # Process video with MoviePy captions (using improved defaults)
+                output_path = process_video_with_captions(
+                    video_path, transcription_data, clip_id
+                    # Uses improved defaults: fontsize=8.0, background_opacity=0.6, position=bottom80
+                )
+                
+                if output_path and os.path.exists(output_path):
+                    print(f"✅ Captions added successfully using MoviePy")
+                    print(f"📁 Captioned output: {output_path} ({os.path.getsize(output_path)} bytes)")
+                    return output_path
+                else:
+                    print(f"⚠️ MoviePy caption processing failed, using original video")
+                    return video_path
+                    
+            except Exception as e:
+                print(f"❌ MoviePy caption processing failed: {e}")
+                import traceback
+                traceback.print_exc()
+                print(f"⚠️ Falling back to original video")
                 return video_path
-            
-            # Add CAPS_OK watermark for debugging (always enabled for this run)
-            # Use the bundled Poppins font for consistency
-            from app.captions.fonts import get_bundled_poppins_bold
-            font_path = get_bundled_poppins_bold()
-            
-            caps_watermark = (
-                f"drawtext=fontfile='{font_path}':text='CAPS_OK':enable='1':"
-                f"x='(w-text_w)/2':y='h-120':"
-                f"fontsize=54:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=20"
-            )
-            
-            # Combine main captions with CAPS_OK watermark
-            full_vf = f"{vf_value},{caps_watermark}"
-            
-            # ✅ Force pixel format first, add a background bar to guarantee visibility
-            # Prepend format=yuv420p and draw a soft background bar so we can always "see" something change
-            if "format=yuv420p" not in vf_value:
-                full_vf = "format=yuv420p," + full_vf
-            
-            if "drawbox" not in vf_value:
-                # Add drawbox only if not already present
-                full_vf = "drawbox=x=0:y=h-340:w=1080:h=320:color=black@0.65:t=fill," + full_vf
-            
-            print(f"🔍 Final filter chain: {full_vf[:200]}...")
-            print(f"🔍 Filter length: {len(full_vf)} characters")
-            
-            cmd = [
-                "ffmpeg", "-i", video_path,
-                "-vf", full_vf,
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                "-preset", "veryfast", "-crf", "23",
-                "-r", "30", "-vsync", "cfr",
-                "-profile:v", "baseline", "-level:v", "3.0", "-tag:v", "avc1",
-                "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
-                "-movflags", "+faststart",
-                "-y", output_path
-            ]
-            
-            print(f"🎬 Burning captions with bulletproof drawtext: {' '.join(cmd)}")
-            print(f"🔍 Filter string: {full_vf}")
-            
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if r.returncode != 0:
-                print(f"❌ FFmpeg drawtext filter failed: {r.stderr}")
-                # Log first 60 lines of stderr for debugging
-                stderr_lines = r.stderr.split('\n')[:60]
-                print(f"🔍 First 60 lines of stderr:")
-                for line in stderr_lines:
-                    print(f"   {line}")
-                raise Exception(f"FFmpeg failed with exit code {r.returncode}")
-            
-            # Verify output dimensions and SAR
-            ok = await self._verify_captioned_video(output_path)
-            if not ok:
-                raise Exception("Caption video verification failed")
-            
-            # FAIL-FAST: Verify captions are actually visible by frame diff
-            if not await self._verify_caption_burn_in(video_path, output_path):
-                raise Exception("Caption burn-in verification failed - captions not visible")
-            
-            print(f"✅ Captions burned successfully using bulletproof drawtext")
-            print(f"📁 Burned output: {output_path} ({os.path.getsize(output_path)} bytes)")
-            
-            return output_path
                 
         except Exception as e:
             print(f"❌ Caption burning failed: {e}")
@@ -2120,12 +2112,24 @@ class VideoProcessor:
         return 0.0
 
     def _seconds_to_srt_time(self, seconds: float) -> str:
-        """Convert seconds to SRT time format (HH:MM:SS,mmm)"""
+        """Convert seconds to SRT time format (HH:MM:SS,mmm) with proper rounding"""
         try:
             hours = int(seconds // 3600)
             minutes = int((seconds % 3600) // 60)
             secs = int(seconds % 60)
-            milliseconds = int((seconds % 1) * 1000)
+            # Round milliseconds instead of truncating to avoid micro-lags
+            milliseconds = int(round((seconds - int(seconds)) * 1000.0))
+            
+            # Handle millisecond overflow
+            if milliseconds == 1000:
+                secs += 1
+                milliseconds = 0
+                if secs == 60:
+                    minutes += 1
+                    secs = 0
+                    if minutes == 60:
+                        hours += 1
+                        minutes = 0
             
             return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
         except Exception as e:

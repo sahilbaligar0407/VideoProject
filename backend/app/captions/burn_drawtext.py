@@ -1,325 +1,147 @@
 #!/usr/bin/env python3
 """
 Bulletproof drawtext filter builder for FFmpeg caption burning.
-Supports Poppins fonts, karaoke highlighting, and proper line wrapping.
+Supports Poppins fonts, progressive word building, and viral word highlighting.
+Implements the "Builder" flow with proper escaping and width fitting.
 """
 
+import random
+import re
 import os
 from typing import List, Dict, Any
-from .fonts import get_bundled_poppins_bold
 
-def escape_text_for_drawtext(text: str) -> str:
+# Wow/Hook words that get highlighted with Poppins-ExtraBold
+WOW = set(map(str.lower, [
+    "wow", "omg", "holy", "insane", "unbelievable", "incredible", "amazing", 
+    "massive", "huge", "shocking", "viral", "trending", "must", "secret", 
+    "hack", "crazy"
+]))
+
+def ff_esc(s: str) -> str:
     """
-    Escape text content for safe use in FFmpeg drawtext filters.
-    Handles apostrophes, quotes, and other problematic characters.
+    Strict escaping for ffmpeg drawtext.
+    Order matters: backslash first, then other problematic characters.
     """
-    if not text:
+    if s is None:
         return ""
     
-    # Replace problematic characters with safe alternatives
-    safe_text = text.replace("'", "'")  # Replace apostrophe with smart quote
-    safe_text = safe_text.replace('"', '"')  # Replace double quote with smart quote
-    safe_text = safe_text.replace(';', ',')  # Replace semicolon with comma
-    safe_text = safe_text.replace(':', ' -')  # Replace colon with dash
+    # Order matters: backslash first
+    s = s.replace("\\", "\\\\")
+    # Escape single quote (we use single-quoted text)
+    s = s.replace("'", r"\'")
+    # Also guard punctuation that can leak out of arg parsing in some builds
+    for ch in [":", ",", ";", "[", "]", "%", "="]:
+        s = s.replace(ch, "\\" + ch)
+    # Newlines to \n
+    s = s.replace("\r\n", r"\n").replace("\n", r"\n")
     
-    # Remove any remaining problematic characters
-    safe_text = ''.join(char for char in safe_text if ord(char) >= 32 and ord(char) <= 126)
-    
-    # Limit text length to prevent filter string issues
-    if len(safe_text) > 100:
-        safe_text = safe_text[:97] + "..."
-    
-    return safe_text
+    return s
 
-def build_visible_caption_test(
-    text: str = "CAPTION_VISIBLE_TEST",
-    clip_start: float = 0.0,
-    clip_duration: float = 6.0
+def _font_arg(path: str) -> str:
+    """Format font path argument with proper escaping"""
+    # Keep single quotes and escape colon/backslashes inside
+    p = path.replace("\\", "\\\\").replace(":", "\\:")
+    return f"fontfile='{p}'"
+
+def build_drawtext_from_states(
+    states: List[Dict[str, Any]],
+    font_black: str,
+    font_extrabold: str,
+    font_bold: str,
+    fontsize: int,
+    margin_bottom: int,
+    clip_seed: int
 ) -> str:
     """
-    Build a highly visible caption test pattern with guaranteed visibility.
+    Returns a single -vf string:
+      format=yuv420p,drawbox=..., [many drawtext=... enable='between(t,...)']
+    
+    We render each state as a single line, but with spans using separate drawtext calls
+    to mix fonts. One random Bold per window (not a WOW) and WOW->ExtraBold.
     
     Args:
-        text: Caption text to display
-        clip_start: Clip start time
-        clip_duration: Clip duration for timing
-    
+        states: List of progressive caption states
+        font_black: Path to Poppins-Black.ttf
+        font_extrabold: Path to Poppins-ExtraBold.ttf
+        font_bold: Path to Poppins-Bold.ttf
+        fontsize: Base font size
+        margin_bottom: Bottom margin for text positioning
+        clip_seed: Seed for reproducible random bold word selection
+        
     Returns:
-        Complete filter string with drawbox background and clamped positioning
+        Complete FFmpeg filter string
     """
-    # Get Poppins font path
-    font_path = get_bundled_poppins_bold()
-    
-    # Build the filter string with guaranteed visibility
-    filter_parts = [
-        # Format first (required for some filters)
-        "format=yuv420p",
-        
-        # Background box behind captions for guaranteed contrast
-        "drawbox=x=0:y=h-340:w=1080:h=320:color=black@0.65:t=fill",
-        
-        # Main caption text
-        f"drawtext=fontfile='{font_path}':text='{text}':x='(w-text_w)/2':y='if(gt(h-240-text_h,0),h-240-text_h,10)':fontsize=64:fontcolor=white:borderw=0:box=1:boxcolor=black@0.0:boxborderw=0:enable='between(t,{clip_start + 0.8:.1f},{clip_start + clip_duration:.1f})'",
-        
-        # CAPS_OK watermark
-        f"drawtext=fontfile='{font_path}':text='CAPS_OK':x='(w-text_w)/2':y='if(gt(h-120-text_h,0),h-120-text_h,10)':fontsize=54:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=20:enable='between(t,{clip_start + 0.8:.1f},{clip_start + clip_duration:.1f})'"
-    ]
-    
-    return ",".join(filter_parts)
+    rng = random.Random(clip_seed)
 
-def build_single_drawtext(
-    text: str,
-    start_time: float,
-    end_time: float,
-    x_pos: str = "(w-text_w)/2",
-    y_pos: str = "h-160",
-    fontsize: int = 48,
-    fontcolor: str = "white",
-    fontfile: str = None,
-    box: bool = True,
-    boxcolor: str = "black@0.6",
-    boxborderw: int = 20,
-    enable_expr: str = None
-) -> str:
-    """
-    Build a single drawtext filter string.
-    
-    Args:
-        text: Text to display
-        start_time: Start time (clip-relative)
-        end_time: End time (clip-relative)
-        x_pos: X position expression
-        y_pos: Y position expression
-        fontsize: Font size
-        fontcolor: Font color
-        fontfile: Font file path
-        box: Whether to add background box
-        boxcolor: Box color with opacity
-        boxborderw: Box border width
-        enable_expr: Custom enable expression (overrides timing)
-    
-    Returns:
-        Complete drawtext filter string
-    """
-    if not text:
-        return ""
-    
-    # Simple text escaping - just replace problematic characters
-    safe_text = text.replace("'", "'")  # Replace apostrophe with different quote
-    safe_text = safe_text.replace('"', '"')  # Replace double quote with different quote
-    safe_text = safe_text.replace(';', ',')  # Replace semicolon with comma
-    
-    # Build filter parts
-    parts = []
-    
-    # Text - use single quotes
-    parts.append(f"text='{safe_text}'")
-    
-    # Timing (enable expression) - use always visible for now to test
-    if enable_expr:
-        parts.append(f"enable='{enable_expr}'")
-    else:
-        parts.append("enable='1'")  # Always visible for testing
-    
-    # Position
-    parts.append(f"x='{x_pos}'")
-    parts.append(f"y='{y_pos}'")
-    
-    # Font properties
-    parts.append(f"fontsize={fontsize}")
-    parts.append(f"fontcolor={fontcolor}")
-    
-    if fontfile:
-        parts.append(f"fontfile='{fontfile}'")
-    
-    # Box properties
-    if box:
-        parts.append("box=1")
-        parts.append(f"boxcolor={boxcolor}")
-        parts.append(f"boxborderw={boxborderw}")
-    
-    # Join with colons
-    return "drawtext=" + ":".join(parts)
+    # Background and format
+    prefix = "format=yuv420p,drawbox=x=0:y=h-340:w=iw:h=320:color=black@0.65:t=fill"
+    parts = [prefix]
 
-def build_karaoke_drawtext(
-    lines: List[List[Dict[str, Any]]],
-    clip_start: float = 0.0,
-    style: str = "poppins_bold_boxed"
-) -> str:
-    """
-    Build karaoke-style drawtext filter with base text and word highlights.
-    
-    Args:
-        lines: Line segments from split_word_timestamps
-        clip_start: Clip start time (for clip-relative timing)
-        style: Style preset name
-    
-    Returns:
-        Complete drawtext filter string
-    """
-    if not lines:
-        return ""
-    
-    # Get style configuration
-    style_config = get_style_config(style)
-    
-    # Build filters for each line segment
-    filters = []
-    
-    for cue in lines:
-        if not cue:
+    # Font arguments
+    fb = _font_arg(font_black)      # Default font
+    fe = _font_arg(font_extrabold)  # Wow/hook words
+    fbo = _font_arg(font_bold)      # Random bold words
+
+    for st in states:
+        toks = st["tokens"]
+        if not toks:
             continue
-        
-        # Base text (white, always visible during cue)
-        cue_start = cue[0]['start'] - clip_start
-        cue_end = cue[-1]['end'] - clip_start
-        
-        # Format text for this cue (max 2 lines)
-        cue_text = '\n'.join(line['text'] for line in cue[:2])
-        
-        # Base layer (white text)
-        base_filter = build_single_drawtext(
-            text=cue_text,
-            start_time=cue_start,
-            end_time=cue_end,
-            x_pos=style_config['x_pos'],
-            y_pos=style_config['y_pos'],
-            fontsize=style_config['fontsize'],
-            fontcolor=style_config['fontcolor'],
-            fontfile=style_config['fontfile'],
-            box=style_config['box'],
-            boxcolor=style_config['boxcolor'],
-            boxborderw=style_config['boxborderw']
-        )
-        filters.append(base_filter)
-        
-        # Word highlight layer (yellow, per-word timing)
-        for line in cue[:2]:  # Max 2 lines
-            for word in line['words']:
-                word_start = word['start'] - clip_start
-                word_end = word['end'] - clip_start
-                
-                # Highlight filter (yellow, word-timed)
-                highlight_filter = build_single_drawtext(
-                    text=word['word'],
-                    start_time=word_start,
-                    end_time=word_end,
-                    x_pos=style_config['x_pos'],
-                    y_pos=style_config['y_pos'],
-                    fontsize=style_config['fontsize'],
-                    fontcolor="yellow",  # Highlight color
-                    fontfile=style_config['fontfile'],
-                    box=False,  # No box for highlights
-                    enable_expr=f"between(t,{word_start:.2f},{word_end:.2f})"
-                )
-                filters.append(highlight_filter)
-    
-    # Join with commas, ensuring no empty filters
-    valid_filters = [f for f in filters if f.strip()]
-    return ",".join(valid_filters)
 
-def get_style_config(style: str = "poppins_bold_boxed") -> Dict[str, Any]:
-    """
-    Get style configuration for caption rendering.
-    
-    Args:
-        style: Style preset name
-    
-    Returns:
-        Style configuration dictionary
-    """
-    if style == "poppins_bold_boxed":
-        return {
-            'fontfile': get_bundled_poppins_bold(),
-            'fontsize': 48,
-            'fontcolor': 'white',
-            'x_pos': '(w-text_w)/2',
-            'y_pos': 'if(gt(h-160-text_h,0),h-160-text_h,10)',  # Clamped Y positioning
-            'box': True,
-            'boxcolor': 'black@0.6',
-            'boxborderw': 20,
-            'marginV': 160
-        }
-    elif style == "poppins_medium_outline":
-        return {
-            'fontfile': get_bundled_poppins_bold(),  # Fallback to bold for now
-            'fontsize': 44,
-            'fontcolor': 'white',
-            'x_pos': '(w-text_w)/2',
-            'y_pos': 'if(gt(h-160-text_h,0),h-160-text_h,10)',  # Clamped Y positioning
-            'box': False,
-            'boxcolor': 'black@0.6',
-            'boxborderw': 0,
-            'marginV': 160
-        }
-    else:
-        # Default fallback
-        return {
-            'fontfile': 'C:/Windows/Fonts/arial.ttf',
-            'fontsize': 48,
-            'fontcolor': 'white',
-            'x_pos': '(w-text_w)/2',
-            'y_pos': 'if(gt(h-160-text_h,0),h-160-text_h,10)',  # Clamped Y positioning
-            'box': True,
-            'boxcolor': 'black@0.6',
-            'boxborderw': 20,
-            'marginV': 160
-        }
+        # Choose one random bold index among non-WOW tokens
+        candidate_idx = [i for i, t in enumerate(toks) if t.lower() not in WOW]
+        bold_idx = rng.choice(candidate_idx) if candidate_idx else None
 
-def build_simple_drawtext_filter_simple(
-    segments: List[Dict[str, Any]],
-    clip_start: float = 0.0,
-    style: str = "poppins_bold_boxed"
-) -> str:
-    """
-    Build a simple drawtext filter for caption burning - simplified version.
-    Process one caption at a time to avoid complex filter string issues.
-    """
-    if not segments:
-        return ""
+        # Build spans: [(text, fontarg)]
+        spans = []
+        for i, tok in enumerate(toks):
+            tclean = tok  # Already cleaned upstream
+            font = fe if tclean.lower() in WOW else (fbo if bold_idx == i else fb)
+            spans.append((tclean, font))
+
+        # Shared geometry & timing
+        enable = f"enable='between(t,{st['start']:.3f},{st['end']:.3f})'"
+        geom = "x=(w-text_w)/2:y=h-260"
+        common = f"{enable}:{geom}:fontsize={int(fontsize)}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=20"
+
+        # One centering pass (invisible) to stabilize text_w across spans
+        # Use an empty space with base font; it still allocates width.
+        parts.append(f"drawtext={fb}:text=' ':{common}")
+
+        # Now actual visible spans layered in order; each uses its own fontfile and text
+        text_so_far = []
+        for text, fontarg in spans:
+            text_so_far.append(text)
+            visible = ff_esc(" ".join(text_so_far))
+            parts.append(f"drawtext={fontarg}:text='{visible}':{common}")
+
+    return ",".join(parts)
+
+def validate_filter_string(vf: str) -> bool:
+    """Simple sanity checks for the filter string"""
+    # Check for basic structure
+    if not vf:
+        return False
     
-    # Get style configuration
-    style_config = get_style_config(style)
+    # Should contain drawtext filters
+    if "drawtext=" not in vf:
+        return False
     
-    # For now, just use the first segment to test
-    if len(segments) > 0:
-        segment = segments[0]
-        
-        # Convert global times to clip-relative times
-        start_local = max(0.0, segment['start'] - clip_start)
-        end_local = max(0.1, segment['end'] - clip_start)
-        
-        # Simple text (no complex line breaks for now)
-        text = segment['text'].replace('\n', ' ')
-        
-        # Skip empty text
-        if not text.strip():
-            return ""
-        
-        # Build single filter (white text with box)
-        single_filter = build_single_drawtext(
-            text=text,
-            start_time=start_local,
-            end_time=end_local,
-            x_pos=style_config['x_pos'],
-            y_pos=style_config['y_pos'],
-            fontsize=style_config['fontsize'],
-            fontcolor=style_config['fontcolor'],
-            fontfile=style_config['fontfile'],
-            box=style_config['box'],
-            boxcolor=style_config['boxcolor'],
-            boxborderw=style_config['boxborderw']
-        )
-        
-        return single_filter
+    # Should contain enable expressions
+    if "enable='between(t," not in vf:
+        return False
     
-    return ""
+    # Should contain background elements
+    if "drawbox" not in vf:
+        return False
+    
+    return True
 
 def build_drawtext_filter(
     clip_start: float,
     segments: List[Dict[str, Any]],
     style: str = "poppins_bold_boxed",
-    debug_watermark: bool = False  # Changed to False since video processor adds it
+    debug_watermark: bool = False,
+    clip_id: str = None
 ) -> str:
     """
     Build complete drawtext filter for caption burning.
@@ -329,249 +151,76 @@ def build_drawtext_filter(
         segments: Caption segments with start, end, text
         style: Style preset name
         debug_watermark: Whether to add debug watermark (deprecated, handled by video processor)
-    
+        clip_id: Clip ID for seeding random number generator
+        
     Returns:
-        Complete drawtext filter string
+        Complete drawtext filter string with progressive word-level timing
     """
     if not segments:
         return ""
     
-    # Use safe phrase-based timed captions for reliable caption rendering
-    # This creates captions that appear as the speaker talks but with safe text
-    main_filter = build_safe_phrase_captions(segments, clip_start, style)
+    # Import the new progressive caption system
+    from .word_events import flatten_word_events
+    from .progressive import build_progressive_states
     
-    # Note: Debug watermark is now added by the video processor
-    # to avoid duplication and ensure proper integration
+    # Get settings for caption configuration
+    from app.settings import settings
+    max_words = getattr(settings, "max_words_per_caption", 5)
+    lead_sec = getattr(settings, "caption_lead_sec", 0.18)
+    min_dur = getattr(settings, "min_caption_dur", 0.12)
+    overlap_sec = getattr(settings, "caption_overlap_sec", 0.05)
+    
+    # Calculate clip end time (approximate if not available)
+    clip_end = clip_start + 60.0  # Default 60s clip, adjust as needed
+    
+    # 1) Flatten segments into word events (keeps ALL speakers)
+    all_words = flatten_word_events(
+        segments, 
+        clip_start, 
+        clip_end, 
+        pad_head=0.25, 
+        pad_tail=0.25
+    )
+    
+    # 2) Build progressive states that build up to max_words then clear
+    states = build_progressive_states(
+        all_words,
+        max_words=max_words,
+        lead_sec=lead_sec,
+        min_dur_sec=min_dur,
+        overlap_sec=overlap_sec
+    )
+    
+    # 3) Get Poppins fonts from outputs/ directory
+    root = os.path.abspath("outputs")
+    font_black = os.path.join(root, "Poppins-Black.ttf")
+    font_bold = os.path.join(root, "Poppins-Bold.ttf")
+    font_extra = os.path.join(root, "Poppins-ExtraBold.ttf")
+    
+    # Check if fonts exist
+    missing = [p for p in [font_black, font_bold, font_extra] if not os.path.exists(p)]
+    if missing:
+        raise Exception(f"Poppins fonts not found in outputs/: {missing}")
+    
+    print(f"✅ Using Poppins Black font: {font_black}")
+    print(f"✅ Using Poppins Bold font: {font_bold}")
+    print(f"✅ Using Poppins ExtraBold font: {font_extra}")
+    
+    # 4) Create seeded random number generator for reproducible bold word selection
+    clip_seed = hash(clip_id) & 0xFFFFFFFF if clip_id else 0
+    
+    # 5) Build drawtext filter from progressive states
+    main_filter = build_drawtext_from_states(
+        states,
+        font_black=font_black,
+        font_extrabold=font_extra,
+        font_bold=font_bold,
+        fontsize=54,  # Default size
+        margin_bottom=260,  # Safe bottom margin
+        clip_seed=clip_seed
+    )
+    
+    print(f"🔍 Generated progressive word-level filter with {len(states)} caption states")
+    print(f"🔍 Using Poppins Black for base text, Bold for random words, ExtraBold for viral words")
     
     return main_filter
-
-def validate_filter_string(filter_string: str) -> bool:
-    """
-    Basic validation of drawtext filter string.
-    
-    Args:
-        filter_string: Filter string to validate
-    
-    Returns:
-        True if valid, False otherwise
-    """
-    print(f"🔍 Validating filter string: {filter_string[:200]}...")
-    print(f"🔍 Filter string length: {len(filter_string)}")
-    
-    if not filter_string:
-        print("❌ Filter string is empty")
-        return False
-    
-    # Check for basic structure - should contain drawtext= somewhere
-    if "drawtext=" not in filter_string:
-        print("❌ Filter string does not contain 'drawtext='")
-        return False
-    
-    # Count the number of drawtext filters
-    drawtext_count = filter_string.count("drawtext=")
-    print(f"🔍 Found {drawtext_count} drawtext filters")
-    
-    if drawtext_count == 0:
-        print("❌ No drawtext filters found")
-        return False
-    
-    # Check for required parameters (should be present in the overall string)
-    required_params = ["text=", "x=", "y=", "fontsize="]
-    for param in required_params:
-        if param not in filter_string:
-            print(f"❌ Missing required parameter: {param}")
-            return False
-    
-    # Check that the string contains the required filter elements
-    # Note: format=yuv420p is added by the video processor, not required here
-    required_elements = ["drawbox", "drawtext="]
-    for element in required_elements:
-        if element not in filter_string:
-            print(f"❌ Missing required element: {element}")
-            return False
-    
-    print("✅ Filter string validation passed")
-    return True
-
-def build_phrase_timed_captions(
-    segments: List[Dict[str, Any]],
-    clip_start: float = 0.0,
-    style: str = "poppins_bold_boxed"
-) -> str:
-    """
-    Build phrase-based timed captions that appear as the speaker talks.
-    Groups words into logical phrases to reduce filter complexity.
-    
-    Args:
-        segments: Caption segments with start, end, text
-        clip_start: Clip start time (for clip-relative timing)
-        style: Style preset name
-    
-    Returns:
-        Complete filter string with phrase-based timing
-    """
-    if not segments:
-        return ""
-    
-    # Get style configuration
-    style_config = get_style_config(style)
-    font_path = get_bundled_poppins_bold()
-    
-    # Build filters for each segment
-    filters = []
-    
-    for segment in segments:
-        if not segment.get('text'):
-            continue
-            
-        # Convert global times to clip-relative times
-        start_local = max(0.0, segment['start'] - clip_start)
-        end_local = max(0.1, segment['end'] - clip_start)
-        
-        # Skip segments that are too short or off-screen
-        if end_local - start_local < 0.2:
-            continue
-            
-        # Clean and prepare text
-        text = segment['text'].strip()
-        if not text:
-            continue
-        
-        # Escape text for safe FFmpeg usage
-        safe_text = escape_text_for_drawtext(text)
-        
-        # Skip if text is too short after escaping
-        if len(safe_text) < 3:
-            continue
-        
-        # Build phrase filter with proper timing
-        phrase_filter = (
-            f"drawtext=fontfile='{font_path}':text='{safe_text}':"
-            f"x='(w-text_w)/2':y='if(gt(h-240-text_h,0),h-240-text_h,10)':"
-            f"fontsize={style_config['fontsize']}:fontcolor={style_config['fontcolor']}:"
-            f"box=1:boxcolor=black@0.6:boxborderw=20:"
-            f"enable='between(t,{start_local:.2f},{end_local:.2f})'"
-        )
-        filters.append(phrase_filter)
-    
-    # Add background box for readability
-    background_filter = "drawbox=x=0:y=h-340:w=1080:h=320:color=black@0.65:t=fill"
-    
-    # Combine all filters
-    all_filters = [background_filter] + filters
-    
-    # Fallback: If no caption filters were created, create a simple test caption
-    if not filters:
-        print(f"⚠️ No caption filters created, adding fallback caption")
-        fallback_filter = (
-            f"drawtext=fontfile='{font_path}':text='Test Caption':"
-            f"x='(w-text_w)/2':y='if(gt(h-240-text_h,0),h-240-text_h,10)':"
-            f"fontsize={style_config['fontsize']}:fontcolor={style_config['fontcolor']}:"
-            f"box=1:boxcolor=black@0.6:boxborderw=20:"
-            f"enable='between(t,1.0,5.0)'"
-        )
-        all_filters.append(fallback_filter)
-    
-    # Add debug caption that stays visible throughout the clip for troubleshooting
-    debug_filter = (
-        f"drawtext=fontfile='{font_path}':text='DEBUG_CAPTION':"
-        f"x='(w-text_w)/2':y='h-50':"
-        f"fontsize=36:fontcolor=red:box=1:boxcolor=black@0.8:boxborderw=10:"
-        f"enable='1'"  # Always visible
-    )
-    all_filters.append(debug_filter)
-    
-    result = ",".join(all_filters)
-    print(f"🔍 Generated filter with {len(filters)} caption filters + 1 background filter + 1 debug filter")
-    return result
-
-def build_safe_phrase_captions(
-    segments: List[Dict[str, Any]],
-    clip_start: float = 0.0,
-    style: str = "poppins_bold_boxed"
-) -> str:
-    """
-    Build safe phrase-based captions that work reliably with FFmpeg.
-    Uses simplified text but preserves real timing.
-    
-    Args:
-        segments: Caption segments with start, end, text
-        clip_start: Clip start time (for clip-relative timing)
-        style: Style preset name
-    
-    Returns:
-        Complete filter string with safe phrase timing
-    """
-    if not segments:
-        return ""
-    
-    # Get style configuration
-    style_config = get_style_config(style)
-    font_path = get_bundled_poppins_bold()
-    
-    # Build filters for each segment
-    filters = []
-    
-    for i, segment in enumerate(segments):
-        if not segment.get('text'):
-            continue
-            
-        # Get timing from segments (these should already be clip-relative)
-        start_local = segment['start']
-        end_local = segment['end']
-        
-        # Sanity check: Ensure timing is valid
-        if start_local < 0:
-            print(f"⚠️ Segment {i+1}: start time negative ({start_local:.2f}s), clamping to 0")
-            start_local = 0.0
-            
-        if end_local <= start_local:
-            print(f"⚠️ Segment {i+1}: end <= start ({start_local:.2f}s <= {end_local:.2f}s), skipping")
-            continue
-            
-        # Clamp end times so END > START by at least 0.08s
-        if end_local - start_local < 0.08:
-            print(f"⚠️ Segment {i+1}: duration too short ({end_local - start_local:.2f}s), expanding to 0.08s")
-            end_local = start_local + 0.08
-            
-        # Skip segments that start too late relative to clip
-        if start_local > 60.0:  # Skip segments that start more than 60s into the clip
-            print(f"⚠️ Skipping segment {i+1}: starts too late ({start_local:.2f}s)")
-            continue
-            
-        # Create safe, simple text for this segment
-        # Use segment number + first few words to avoid parsing issues
-        original_text = segment['text'].strip()
-        if len(original_text) > 20:
-            safe_text = f"Caption {i+1}: {original_text[:15]}..."
-        else:
-            safe_text = f"Caption {i+1}: {original_text}"
-        
-        # Ensure text is completely safe
-        safe_text = ''.join(char for char in safe_text if ord(char) >= 32 and ord(char) <= 126)
-        safe_text = safe_text.replace("'", "").replace('"', "").replace(';', ",").replace(':', " -")
-        
-        # Skip if text is too short after cleaning
-        if len(safe_text) < 5:
-            print(f"⚠️ Skipping segment {i+1}: text too short after cleaning")
-            continue
-        
-        print(f"✅ Processing segment {i+1}: '{safe_text}' ({start_local:.2f}s - {end_local:.2f}s)")
-        
-        # Build phrase filter with proper timing and clamped Y positioning
-        phrase_filter = (
-            f"drawtext=fontfile='{font_path}':text='{safe_text}':"
-            f"x='(w-text_w)/2':y='if(gt(h-240-text_h,0),h-240-text_h,10)':"  # Clamped Y positioning
-            f"fontsize={style_config['fontsize']}:fontcolor={style_config['fontcolor']}:"
-            f"box=1:boxcolor=black@0.6:boxborderw=20:"
-            f"enable='between(t,{start_local:.2f},{end_local:.2f})'"  # Use clip-relative times directly
-        )
-        filters.append(phrase_filter)
-    
-    # Add background box for readability
-    background_filter = "drawbox=x=0:y=h-340:w=1080:h=320:color=black@0.65:t=fill"
-    
-    # Combine all filters
-    all_filters = [background_filter] + filters
-    
-    return ",".join(all_filters)

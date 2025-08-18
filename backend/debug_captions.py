@@ -1,197 +1,139 @@
 #!/usr/bin/env python3
 """
-Debug script for caption burning with verbose output.
-Run with: DEBUG_CAPTIONS=1 python debug_captions.py
+Debug script to figure out why captions aren't visible on the generated video.
 """
 
 import os
+import json
 import sys
-import asyncio
-import tempfile
-import hashlib
-import subprocess
 from pathlib import Path
 
-# Add the app directory to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'app'))
+# Add the app directory to the path so we can import our modules
+sys.path.append(os.path.join(os.path.dirname(__file__), 'app'))
 
-from app.services.video_processor import VideoProcessor
-from app.captions.styles import render_captions, CaptionStyle
+from captions.moviepy_captions import process_video_with_captions
 
-async def debug_caption_burning():
-    """Debug caption burning with verbose output"""
-    print("🔍 DEBUG: Caption Burning Diagnostic")
-    print("=" * 50)
+def debug_caption_visibility():
+    """Debug why captions aren't visible."""
     
-    # Set debug environment
-    os.environ['DEBUG_CAPTIONS'] = '1'
+    clip_id = "clip_1_70dbf0b1-e93f-4c66-9998-412afe0b79ca"
+    video_path = f"outputs/{clip_id}.mp4"
+    json_path = f"outputs/{clip_id}.json"
+    captioned_path = f"outputs/{clip_id}_captioned.mp4"
     
-    # Create a simple test video (2-3 seconds solid color)
-    print("\n📹 Step 1: Creating test video...")
-    test_video = create_test_video()
-    print(f"✅ Test video created: {test_video}")
-    print(f"   Size: {os.path.getsize(test_video)} bytes")
+    print(f"🔍 Debugging caption visibility for: {clip_id}")
+    print("=" * 60)
     
-    # Create a simple test SRT
-    print("\n📝 Step 2: Creating test SRT...")
-    test_srt = create_test_srt()
-    print(f"✅ Test SRT created: {test_srt}")
-    print(f"   Size: {os.path.getsize(test_srt)} bytes")
+    # 1. Check if files exist
+    print("📁 File existence check:")
+    print(f"   Original video: {'✅' if os.path.exists(video_path) else '❌'} {video_path}")
+    print(f"   JSON data: {'✅' if os.path.exists(json_path) else '❌'} {json_path}")
+    print(f"   Captioned video: {'✅' if os.path.exists(captioned_path) else '❌'} {captioned_path}")
     
-    # Show SRT content and validation
-    print("\n📋 SRT Content (first 20 lines):")
-    with open(test_srt, 'r', encoding='utf-8') as f:
-        content = f.read()
-        lines = content.split('\n')[:20]
-        for i, line in enumerate(lines, 1):
-            print(f"   {i:2d}: {repr(line)}")
+    # 2. Check font availability
+    print("\n🔤 Font availability check:")
+    poppins_path = "outputs/Poppins-Bold.ttf"
+    arial_path = "C:/Windows/Fonts/arial.ttf"
     
-    # Validate SRT
-    print("\n✅ SRT Validation:")
-    srt_valid = validate_srt(test_srt)
-    print(f"   Valid: {srt_valid}")
+    print(f"   Poppins-Bold.ttf: {'✅' if os.path.exists(poppins_path) else '❌'} {poppins_path}")
+    print(f"   Arial fallback: {'✅' if os.path.exists(arial_path) else '❌'} {arial_path}")
     
-    # Show file details
-    print(f"\n📊 File Details:")
-    print(f"   SRT Path: {os.path.abspath(test_srt)}")
-    print(f"   SRT SHA1: {calculate_sha1(test_srt)}")
-    print(f"   Encoding: UTF-8 (no BOM)")
+    # 3. Check video properties
+    print("\n🎬 Video properties check:")
+    if os.path.exists(video_path):
+        try:
+            from moviepy import VideoFileClip
+            clip = VideoFileClip(video_path)
+            print(f"   Frame size: {clip.size}")
+            print(f"   Duration: {clip.duration:.2f}s")
+            print(f"   FPS: {clip.fps}")
+            clip.close()
+        except Exception as e:
+            print(f"   ❌ Error reading video: {e}")
     
-    # Test caption burning
-    print("\n🎬 Step 3: Testing caption burning...")
-    processor = VideoProcessor()
-    
-    # Create a dummy ASS file (since the function expects it)
-    test_ass = test_srt.replace('.srt', '.ass')
-    with open(test_ass, 'w', encoding='utf-8') as f:
-        f.write("""[Script Info]
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,48,&H00FFFFFF&,&H00FFFFFF&,&H00000000&,&H80000000&,0,0,0,0,100,100,0,0,1,2,0,2,80,80,160,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Hello world
-Dialogue: 0,0:00:03.00,0:00:05.00,Default,,0,0,0,,This is a test caption
-""")
-    
-    print(f"✅ Test ASS created: {test_ass}")
-    
-    # Run caption burning with verbose logging
-    print("\n🔥 Running caption burning...")
-    try:
-        result = await processor._burn_ass_captions(test_video, test_ass)
-        print(f"✅ Caption burning result: {result}")
-    except Exception as e:
-        print(f"❌ Caption burning failed: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Cleanup
-    print("\n🧹 Cleaning up...")
-    for file in [test_video, test_srt, test_ass]:
-        if os.path.exists(file):
-            os.remove(file)
-            print(f"   Removed: {file}")
-    
-    print("\n✅ Debug complete!")
-
-def create_test_video():
-    """Create a simple 3-second solid color test video"""
-    output_path = "test_video.mp4"
-    
-    # Create a simple solid color video using FFmpeg
-    cmd = [
-        "ffmpeg", "-f", "lavfi", "-i", "color=c=red:size=1080x1920:duration=3",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast",
-        "-y", output_path
-    ]
-    
-    print(f"   Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print(f"   ❌ FFmpeg failed: {result.stderr}")
-        # Create a dummy file for testing
-        with open(output_path, 'w') as f:
-            f.write("dummy video content")
-        return output_path
-    
-    return output_path
-
-def create_test_srt():
-    """Create a simple test SRT file"""
-    output_path = "test_captions.srt"
-    
-    srt_content = """1
-00:00:00,000 --> 00:00:02,000
-Hello world
-
-2
-00:00:03,000 --> 00:00:05,000
-This is a test caption
-
-3
-00:00:06,000 --> 00:00:08,000
-Short text
-"""
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(srt_content)
-    
-    return output_path
-
-def validate_srt(srt_path):
-    """Validate SRT file format"""
-    try:
-        with open(srt_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Basic SRT validation
-        lines = content.strip().split('\n')
-        if len(lines) < 3:
-            return False
-        
-        # Check structure
-        i = 0
-        while i < len(lines):
-            # Should have caption number
-            if not lines[i].strip().isdigit():
-                return False
-            i += 1
+    # 4. Check transcription data
+    print("\n📝 Transcription data check:")
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
             
-            # Should have timing
-            if i >= len(lines) or ' --> ' not in lines[i]:
-                return False
-            i += 1
+            segments = data.get('segments', [])
+            print(f"   Total segments: {len(segments)}")
             
-            # Should have text
-            if i >= len(lines):
-                return False
-            i += 1
+            if segments:
+                first_seg = segments[0]
+                print(f"   First segment: '{first_seg.get('text', 'N/A')}'")
+                print(f"   First timing: {first_seg.get('start', 0):.2f}s - {first_seg.get('end', 0):.2f}s")
+                
+                last_seg = segments[-1]
+                print(f"   Last segment: '{last_seg.get('text', 'N/A')}'")
+                print(f"   Last timing: {last_seg.get('start', 0):.2f}s - {last_seg.get('end', 0):.2f}s")
+        except Exception as e:
+            print(f"   ❌ Error reading JSON: {e}")
+    
+    # 5. Test with different caption settings
+    print("\n🧪 Testing caption generation with different settings:")
+    
+    if os.path.exists(json_path) and os.path.exists(video_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
             
-            # Should have empty line separator (except for last caption)
-            if i < len(lines) and lines[i].strip() != '':
-                return False
-            i += 1
-        
-        return True
-        
-    except Exception as e:
-        print(f"   Validation error: {e}")
-        return False
-
-def calculate_sha1(file_path):
-    """Calculate SHA1 hash of file"""
-    try:
-        with open(file_path, 'rb') as f:
-            return hashlib.sha1(f.read()).hexdigest()
-    except Exception:
-        return "ERROR"
+            segments = data.get('segments', [])
+            
+            # Convert to word-level data
+            word_data = []
+            for segment in segments:
+                word_data.append({
+                    'word': segment['text'],
+                    'start': float(segment['start']),
+                    'end': float(segment['end'])
+                })
+            
+            # Test with more visible settings
+            test_output = f"outputs/{clip_id}_debug_captioned.mp4"
+            
+            print(f"   🎯 Testing with debug settings...")
+            print(f"   📍 Position: center (instead of bottom75)")
+            print(f"   🎨 Font size: 8.0 (instead of 4.0)")
+            print(f"   🌈 Background: semi-transparent black")
+            
+            result = process_video_with_captions(
+                video_path=video_path,
+                transcription_data=word_data,
+                clip_id=clip_id,
+                fontsize=8.0,  # Much larger font
+                max_chars=50,   # Allow longer lines
+                color="white",
+                highlight_color="yellow",
+                background_opacity=0.7,  # Visible background
+                position="center"  # Center of screen
+            )
+            
+            if result and os.path.exists(result):
+                print(f"   ✅ Debug captioned video created: {result}")
+                print(f"   📊 Size: {os.path.getsize(result)} bytes")
+                
+                # Rename to debug version
+                if os.path.exists(test_output):
+                    os.remove(test_output)
+                os.rename(result, test_output)
+                print(f"   🔄 Renamed to: {test_output}")
+                
+            else:
+                print(f"   ❌ Failed to create debug captioned video")
+                
+        except Exception as e:
+            print(f"   ❌ Error in debug caption test: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    print("\n" + "=" * 60)
+    print("🎯 Next steps:")
+    print("1. Check if the debug captioned video has visible captions")
+    print("2. If yes, the issue was positioning/sizing")
+    print("3. If no, there's a deeper issue with the caption system")
 
 if __name__ == "__main__":
-    asyncio.run(debug_caption_burning())
+    debug_caption_visibility()

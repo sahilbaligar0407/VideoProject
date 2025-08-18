@@ -9,34 +9,117 @@ from pathlib import Path
 
 def get_bundled_poppins_bold() -> str:
     """
-    Get the bundled Poppins-ExtraBold.ttf path with Windows-safe escaping.
-    This is the primary font for caption rendering.
+    Get the path to Poppins-Bold.ttf font file.
+    Returns an absolute, Windows-safe escaped path.
     """
-    # Try multiple locations for the bundled Poppins font
-    current_dir = Path(__file__).parent
     possible_paths = [
-        # repo-relative: assets/fonts/poppins/Poppins-ExtraBold.ttf
-        current_dir.parent.parent.parent / "assets" / "fonts" / "poppins" / "Poppins-ExtraBold.ttf",
-        # outputs folder (where user placed it)
-        current_dir.parent.parent.parent / "outputs" / "Poppins-ExtraBold.ttf",
-        # current working directory
-        Path.cwd() / "Poppins-ExtraBold.ttf",
-        # outputs subdirectory
-        Path.cwd() / "outputs" / "Poppins-ExtraBold.ttf"
+        "assets/fonts/poppins/Poppins-Bold.ttf",
+        "outputs/Poppins-Bold.ttf",
+        "Poppins-Bold.ttf",
+        os.path.join(os.path.dirname(__file__), "..", "..", "assets", "fonts", "poppins", "Poppins-Bold.ttf"),
+        os.path.join(os.path.dirname(__file__), "..", "..", "outputs", "Poppins-Bold.ttf")
     ]
     
-    for poppins_path in possible_paths:
-        if poppins_path.exists():
-            # Convert to Windows-safe absolute path for FFmpeg
-            abs_path = str(poppins_path.absolute())
+    for path in possible_paths:
+        if os.path.exists(path):
+            # Convert to absolute path and escape for Windows
+            abs_path = os.path.abspath(path)
             # Escape backslashes and colons for FFmpeg on Windows
             escaped_path = abs_path.replace("\\", "\\\\").replace(":", "\\:")
-            print(f"✅ Using Poppins font: {abs_path}")
+            print(f"✅ Using Poppins Bold font: {abs_path}")
             return escaped_path
     
-    # Fallback to system fonts if bundled font not found
-    print("⚠️ Bundled Poppins font not found, falling back to system fonts")
-    return get_fontfile("Poppins-ExtraBold.ttf")
+    # Fallback to system fonts if Poppins not found
+    fallback_paths = [
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/tahoma.ttf"
+    ]
+    
+    for path in fallback_paths:
+        if os.path.exists(path):
+            escaped_path = path.replace("\\", "\\\\").replace(":", "\\:")
+            print(f"⚠️ Poppins Bold not found, using fallback: {path}")
+            return escaped_path
+    
+    # Last resort
+    print("⚠️ No suitable fonts found, using default")
+    return "C:/Windows/Fonts/arial.ttf"
+
+def get_bundled_poppins_black() -> str:
+    """
+    Get the path to Poppins-Black.ttf font file.
+    Returns an absolute, Windows-safe escaped path.
+    """
+    possible_paths = [
+        "assets/fonts/poppins/Poppins-Black.ttf",
+        "outputs/Poppins-Black.ttf",
+        "Poppins-Black.ttf",
+        os.path.join(os.path.dirname(__file__), "..", "..", "assets", "fonts", "poppins", "Poppins-Black.ttf"),
+        os.path.join(os.path.dirname(__file__), "..", "..", "outputs", "Poppins-Black.ttf")
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            # Convert to absolute path and escape for Windows
+            abs_path = os.path.abspath(path)
+            # Escape backslashes and colons for FFmpeg on Windows
+            escaped_path = abs_path.replace("\\", "\\\\").replace(":", "\\:")
+            print(f"✅ Using Poppins Black font: {abs_path}")
+            return escaped_path
+    
+    # Fallback to system fonts if Poppins not found
+    fallback_paths = [
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/tahoma.ttf"
+    ]
+    
+    for path in fallback_paths:
+        if os.path.exists(path):
+            escaped_path = path.replace("\\", "\\\\").replace(":", "\\:")
+            print(f"⚠️ Poppins Black not found, using fallback: {path}")
+            return escaped_path
+    
+    # Last resort
+    print("⚠️ No suitable fonts found, using default")
+    return "C:/Windows/Fonts/arial.ttf"
+
+def get_bundled_poppins_extrabold() -> str:
+    """
+    Get the path to Poppins-ExtraBold.ttf font file.
+    Returns an absolute, Windows-safe escaped path.
+    """
+    possible_paths = [
+        "assets/fonts/poppins/Poppins-ExtraBold.ttf",
+        "outputs/Poppins-ExtraBold.ttf",
+        "Poppins-ExtraBold.ttf",
+        os.path.join(os.path.dirname(__file__), "..", "..", "assets", "fonts", "poppins", "Poppins-ExtraBold.ttf"),
+        os.path.join(os.path.dirname(__file__), "..", "..", "outputs", "Poppins-ExtraBold.ttf")
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            # Convert to absolute path and escape for Windows
+            abs_path = os.path.abspath(path)
+            # Escape backslashes and colons for FFmpeg on Windows
+            escaped_path = abs_path.replace("\\", "\\\\").replace(":", "\\:")
+            print(f"✅ Using Poppins ExtraBold font: {abs_path}")
+            return escaped_path
+    
+    # Fallback to system fonts if Poppins not found
+    fallback_paths = [
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/tahoma.ttf"
+    ]
+    
+    for path in fallback_paths:
+        if os.path.exists(path):
+            escaped_path = path.replace("\\", "\\\\").replace(":", "\\:")
+            print(f"⚠️ Poppins ExtraBold not found, using fallback: {path}")
+            return escaped_path
+    
+    # Last resort
+    print("⚠️ No suitable fonts found, using default")
+    return "C:/Windows/Fonts/arial.ttf"
 
 def get_fontfile(preferred: str = "Poppins-ExtraBold.ttf") -> str:
     """

@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     topic_search_enabled: bool = True
     topic_embedding_threshold: float = 0.7
     
+    # Caption timing settings (fixes Whisper's natural lag ~120-220ms)
+    caption_lead_sec: float = 0.18  # 180ms lead-in for captions
+    min_caption_dur: float = 0.12   # Minimum 120ms on-screen time
+
+    # Progressive word reveal settings
+    max_words_per_caption: int = 5  # Maximum words per caption chunk
+    caption_overlap_sec: float = 0.05  # 50ms overlap between captions for smooth transitions
+    
     class Config:
         env_file = ".env"
 
