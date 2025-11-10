@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -14,8 +14,18 @@ class TranscriptionResult(BaseModel):
     language: str
     duration: float
 
+class ClipRanking(BaseModel):
+    """Model for clip ranking and virality scoring"""
+    viral_score: float  # 0.0 to 5.0 scale
+    engagement_potential: float  # 0.0 to 1.0
+    shareability: float  # 0.0 to 1.0
+    trending_potential: float  # 0.0 to 1.0
+    ranking_factors: Dict[str, float]  # Detailed breakdown of scoring factors
+
 class HighlightSegment(BaseModel):
     """Model for detected highlight segments"""
+    model_config = ConfigDict(extra="allow")  # Allow extra fields for backward compatibility
+    
     start_time: float
     end_time: float
     duration: float
@@ -23,6 +33,7 @@ class HighlightSegment(BaseModel):
     keywords: List[str]
     transcript_segment: str
     detection_method: Optional[str] = None  # Method used to detect this highlight
+    ranking: Optional[ClipRanking] = None  # Ranking information (added by ClipRanker)
 
 class GeneratedClip(BaseModel):
     """Model for generated highlight clips"""
@@ -34,6 +45,9 @@ class GeneratedClip(BaseModel):
     thumbnail_path: Optional[str] = None
     caption_text: str
     download_url: str
+    ranking: Optional[ClipRanking] = None  # New ranking information
+    face_tracking_applied: bool = False  # Whether face tracking was used
+    speaker_centered: bool = False  # Whether speaker was kept centered
 
 class ProcessingStatus(BaseModel):
     """Model for processing status updates"""

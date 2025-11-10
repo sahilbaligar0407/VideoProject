@@ -17,7 +17,7 @@ def generate_clip_manifest(
     duration: float,
     output_path: str,
     layout_states: List[Dict[str, Any]],
-    caption_info: Dict[str, Any],
+    transcript_info: Dict[str, Any],
     processing_metadata: Dict[str, Any],
     output_dir: str = "outputs"
 ) -> str:
@@ -32,7 +32,7 @@ def generate_clip_manifest(
         duration: Clip duration (seconds)
         output_path: Path to generated clip file
         layout_states: List of layout state changes during clip
-        caption_info: Caption generation information
+        transcript_info: Transcript file information
         processing_metadata: Additional processing metadata
         output_dir: Output directory for manifest
         
@@ -75,15 +75,10 @@ def generate_clip_manifest(
             "face_tracking": _extract_face_tracking_info(layout_states)
         },
         
-        # Caption information
-        "captions": {
-            "enabled": caption_info.get("enabled", True),
-            "mode": caption_info.get("mode", "sidecar"),
-            "style": caption_info.get("style", "boxed_high_contrast"),
-            "theme": caption_info.get("theme", "default"),
-            "languages": caption_info.get("languages", ["en"]),
-            "burn_in_language": caption_info.get("burn_in_language", "en"),
-            "files": _generate_caption_file_list(caption_info, clip_id, output_dir)
+        # Transcript file information
+        "transcripts": {
+            "enabled": transcript_info.get("enabled", True),
+            "files": _generate_transcript_file_list(transcript_info, clip_id, output_dir)
         },
         
         # Processing metadata
@@ -103,15 +98,14 @@ def generate_clip_manifest(
         # Quality metrics
         "quality": {
             "vertical_rendering": _assess_vertical_quality(layout_states),
-            "caption_quality": _assess_caption_quality(caption_info),
-            "overall_score": _calculate_overall_quality(layout_states, caption_info)
+            "overall_score": _assess_vertical_quality(layout_states).get("score", 0)
         },
         
         # File integrity
         "integrity": {
             "video_file_size": _get_file_size(output_path),
             "video_file_hash": _calculate_file_hash(output_path),
-            "caption_files": _verify_caption_files(caption_info, clip_id, output_dir)
+            "transcript_files": _verify_transcript_files(transcript_info, clip_id, output_dir)
         }
     }
     
@@ -208,30 +202,26 @@ def _extract_face_tracking_info(layout_states: List[Dict[str, Any]]) -> Dict[str
     
     return face_info
 
-def _generate_caption_file_list(caption_info: Dict[str, Any], clip_id: str, output_dir: str) -> List[Dict[str, Any]]:
-    """Generate list of caption files for different languages and formats"""
-    caption_files = []
+def _generate_transcript_file_list(transcript_info: Dict[str, Any], clip_id: str, output_dir: str) -> List[Dict[str, Any]]:
+    """Generate list of transcript files for different formats"""
+    transcript_files = []
     
-    if not caption_info.get("enabled", True):
-        return caption_files
+    if not transcript_info.get("enabled", True):
+        return transcript_files
     
-    languages = caption_info.get("languages", ["en"])
     formats = ["srt", "vtt", "ass", "json"]
     
-    for lang in languages:
-        for fmt in formats:
-            filename = f"{clip_id}_captions_{lang}.{fmt}"
-            filepath = os.path.join(output_dir, filename)
-            
-            caption_files.append({
-                "language": lang,
-                "format": fmt,
-                "filename": filename,
-                "filepath": filepath,
-                "burn_in": lang == caption_info.get("burn_in_language", "en")
-            })
+    for fmt in formats:
+        filename = f"{clip_id}.{fmt}"
+        filepath = os.path.join(output_dir, filename)
+        
+        transcript_files.append({
+            "format": fmt,
+            "filename": filename,
+            "filepath": filepath
+        })
     
-    return caption_files
+    return transcript_files
 
 def _assess_vertical_quality(layout_states: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Assess the quality of vertical rendering"""
@@ -285,101 +275,6 @@ def _assess_vertical_quality(layout_states: List[Dict[str, Any]]) -> Dict[str, A
         "issues": issues
     }
 
-def _assess_caption_quality(caption_info: Dict[str, Any]) -> Dict[str, Any]:
-    """Assess the quality of caption generation"""
-    score = 100
-    issues = []
-    
-    if not caption_info.get("enabled", True):
-        return {"score": 0, "issues": ["Captions disabled"]}
-    
-    # Check caption mode
-    mode = caption_info.get("mode", "sidecar")
-    if mode == "burn":
-        score += 10  # Bonus for burn-in
-    elif mode == "off":
-        score -= 50
-        issues.append("Captions turned off")
-    
-    # Check style
-    style = caption_info.get("style", "boxed_high_contrast")
-    if style in ["boxed_high_contrast", "outline_bold"]:
-        score += 5  # Bonus for high-quality styles
-    
-    # Check languages
-    languages = caption_info.get("languages", ["en"])
-    if len(languages) > 1:
-        score += 15  # Bonus for multi-language support
-    
-    # Check burn-in language
-    burn_lang = caption_info.get("burn_in_language", "en")
-    if burn_lang in languages:
-        score += 5
-    else:
-        score -= 10
-        issues.append("Burn-in language not in supported languages")
-    
-    return {
-        "score": max(0, score),
-        "mode": mode,
-        "style": style,
-        "languages_count": len(languages),
-        "burn_in_language": burn_lang,
-        "issues": issues
-    }
-
-def _calculate_overall_quality(layout_states: List[Dict[str, Any]], caption_info: Dict[str, Any]) -> Dict[str, Any]:
-    """Calculate overall quality score for the clip"""
-    layout_quality = _assess_vertical_quality(layout_states)
-    caption_quality = _assess_caption_quality(caption_info)
-    
-    # Weighted scoring: 70% layout, 30% captions
-    overall_score = (layout_quality["score"] * 0.7) + (caption_quality["score"] * 0.3)
-    
-    # Determine quality level
-    if overall_score >= 90:
-        quality_level = "excellent"
-    elif overall_score >= 75:
-        quality_level = "good"
-    elif overall_score >= 60:
-        quality_level = "fair"
-    elif overall_score >= 40:
-        quality_level = "poor"
-    else:
-        quality_level = "very_poor"
-    
-    return {
-        "score": round(overall_score, 1),
-        "level": quality_level,
-        "layout_score": layout_quality["score"],
-        "caption_score": caption_quality["score"],
-        "recommendations": _generate_quality_recommendations(layout_quality, caption_quality)
-    }
-
-def _generate_quality_recommendations(layout_quality: Dict[str, Any], caption_quality: Dict[str, Any]) -> List[str]:
-    """Generate quality improvement recommendations"""
-    recommendations = []
-    
-    # Layout recommendations
-    if layout_quality["score"] < 80:
-        if "Low face-focused rendering ratio" in layout_quality["issues"]:
-            recommendations.append("Improve face detection sensitivity or lighting")
-        if "Excessive state transitions" in layout_quality["issues"]:
-            recommendations.append("Increase state transition debounce frames")
-        if "Scene cuts detected" in layout_quality["issues"]:
-            recommendations.append("Review source video for abrupt scene changes")
-    
-    # Caption recommendations
-    if caption_quality["score"] < 80:
-        if "Captions turned off" in caption_quality["issues"]:
-            recommendations.append("Enable captions for better accessibility")
-        if "Burn-in language not in supported languages" in caption_quality["issues"]:
-            recommendations.append("Ensure burn-in language is in supported languages list")
-    
-    if not recommendations:
-        recommendations.append("Clip quality is excellent - no improvements needed")
-    
-    return recommendations
 
 def _get_file_size(file_path: str) -> Optional[int]:
     """Get file size in bytes"""
@@ -404,23 +299,22 @@ def _calculate_file_hash(file_path: str) -> Optional[str]:
         pass
     return None
 
-def _verify_caption_files(caption_info: Dict[str, Any], clip_id: str, output_dir: str) -> List[Dict[str, Any]]:
-    """Verify existence and integrity of caption files"""
+def _verify_transcript_files(transcript_info: Dict[str, Any], clip_id: str, output_dir: str) -> List[Dict[str, Any]]:
+    """Verify existence and integrity of transcript files"""
     verification_results = []
     
-    if not caption_info.get("enabled", True):
+    if not transcript_info.get("enabled", True):
         return verification_results
     
-    caption_files = _generate_caption_file_list(caption_info, clip_id, output_dir)
+    transcript_files = _generate_transcript_file_list(transcript_info, clip_id, output_dir)
     
-    for caption_file in caption_files:
-        filepath = caption_file["filepath"]
+    for transcript_file in transcript_files:
+        filepath = transcript_file["filepath"]
         exists = os.path.exists(filepath)
         size = _get_file_size(filepath) if exists else None
         
         verification_results.append({
-            "language": caption_file["language"],
-            "format": caption_file["format"],
+            "format": transcript_file["format"],
             "exists": exists,
             "file_size": size,
             "file_hash": _calculate_file_hash(filepath) if exists else None
@@ -458,8 +352,7 @@ def generate_batch_manifest(
             "duration": clip.get("duration", 0),
             "output_path": clip.get("output_path", ""),
             "layout_mode": clip.get("layout_mode", "unknown"),
-            "caption_enabled": clip.get("caption_enabled", True),
-            "languages": clip.get("languages", ["en"])
+            "transcript_enabled": clip.get("transcript_enabled", True)
         }
         batch_manifest["clips"].append(clip_summary)
     

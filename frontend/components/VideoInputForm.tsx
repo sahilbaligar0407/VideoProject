@@ -11,7 +11,6 @@ const VideoInputForm: React.FC<VideoInputFormProps> = ({ onProcessingStart }) =>
   const [isProcessing, setIsProcessing] = useState(false);
   const [activeTab, setActiveTab] = useState<'youtube' | 'upload'>('youtube');
   const [addCaptions, setAddCaptions] = useState(true);
-  const [captionMode, setCaptionMode] = useState<'burn' | 'sidecar' | 'off'>('sidecar');
   const [userTopics, setUserTopics] = useState('');
   const [vertical, setVertical] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -46,7 +45,6 @@ const VideoInputForm: React.FC<VideoInputFormProps> = ({ onProcessingStart }) =>
       }
       
       formData.append('add_captions', addCaptions.toString());
-      formData.append('caption_mode', captionMode);
       if (userTopics.trim()) {
         formData.append('user_topics', userTopics.trim());
       }
@@ -184,29 +182,6 @@ const VideoInputForm: React.FC<VideoInputFormProps> = ({ onProcessingStart }) =>
             Automatically generate and burn in captions from the video transcript
           </p>
           
-          {/* Caption Mode Selector */}
-          {addCaptions && (
-            <div className="mt-3 ml-7">
-              <label htmlFor="captionMode" className="block text-sm font-medium text-blue-800 mb-2">
-                Caption Style:
-              </label>
-              <select
-                id="captionMode"
-                value={captionMode}
-                onChange={(e) => setCaptionMode(e.target.value as 'burn' | 'sidecar' | 'off')}
-                className="block w-full px-3 py-2 border border-blue-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              >
-                <option value="sidecar">📄 Sidecar (VTT/ASS/JSON) - Export files for later styling</option>
-                <option value="burn">🔥 Burn In - Captions embedded in video</option>
-                <option value="off">❌ No Captions - Just the video</option>
-              </select>
-              <p className="text-xs text-blue-600 mt-1">
-                {captionMode === 'sidecar' && "Exports WebVTT, ASS, and JSON files for SEO and design flexibility"}
-                {captionMode === 'burn' && "Captions are permanently embedded in the video with mobile-safe positioning"}
-                {captionMode === 'off' && "No caption files generated"}
-              </p>
-            </div>
-          )}
         </div>
 
         {/* User Topics Input */}

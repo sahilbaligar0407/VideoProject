@@ -7,18 +7,7 @@ from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
 from enum import Enum
 
-class CaptionMode(str, Enum):
-    """Caption rendering modes"""
-    BURN = "burn"
-    SIDECAR = "sidecar"
-    OFF = "off"
-
-class CaptionStyle(str, Enum):
-    """Caption styling options"""
-    BOXED = "boxed"
-    OUTLINE = "outline"
-    KARAOKE = "karaoke"
-    DEFAULT = "default"
+# Caption rendering removed - transcript generation only
 
 class BackgroundMode(str, Enum):
     """Background rendering modes"""
@@ -41,14 +30,10 @@ class CTAType(str, Enum):
     LIKE = "like"
     SHARE = "share"
 
-class CaptionConfig(BaseModel):
-    """Caption configuration"""
-    mode: CaptionMode = CaptionMode.SIDECAR
-    language: str = "auto"
-    style: CaptionStyle = CaptionStyle.DEFAULT
-    safe_bottom: int = 160  # pixels from bottom
-    max_lines: int = 2
-    word_by_word: bool = False
+class TranscriptConfig(BaseModel):
+    """Transcript file generation configuration"""
+    language: str = "auto"  # Language for transcription
+    enabled: bool = True    # Whether to generate transcript files
 
 class BackgroundConfig(BaseModel):
     """Background configuration"""
@@ -80,7 +65,7 @@ class VideoConfig(BaseModel):
 
 class PipelineConfig(BaseModel):
     """Main pipeline configuration"""
-    captions: CaptionConfig = CaptionConfig()
+    transcripts: TranscriptConfig = TranscriptConfig()
     background: BackgroundConfig = BackgroundConfig()
     face_tracking: FaceTrackingConfig = FaceTrackingConfig()
     ai: AIConfig = AIConfig()
@@ -91,6 +76,12 @@ class PipelineConfig(BaseModel):
     enable_speech_analysis: bool = True
     enable_viral_scoring: bool = True
     enable_hook_detection: bool = True
+    
+    # Legacy compatibility - map captions to transcripts
+    @property
+    def captions(self):
+        """Legacy property for backward compatibility"""
+        return self.transcripts
 
 def get_default_config() -> PipelineConfig:
     """Get default pipeline configuration"""
@@ -107,10 +98,6 @@ def load_config_from_dict(config_dict: Dict[str, Any]) -> PipelineConfig:
 def validate_config(config: PipelineConfig) -> List[str]:
     """Validate configuration and return list of warnings"""
     warnings = []
-    
-    # Validate caption settings
-    if config.captions.mode == CaptionMode.BURN and config.captions.word_by_word:
-        warnings.append("Word-by-word captions not supported in burn mode")
     
     # Validate background settings
     if config.background.mode == BackgroundMode.GAMEPLAY and not config.background.game:
@@ -132,10 +119,9 @@ def validate_config(config: PipelineConfig) -> List[str]:
 def get_config_summary(config: PipelineConfig) -> Dict[str, Any]:
     """Get human-readable configuration summary"""
     return {
-        "captions": {
-            "mode": config.captions.mode.value,
-            "language": config.captions.language,
-            "style": config.captions.style.value
+        "transcripts": {
+            "enabled": config.transcripts.enabled,
+            "language": config.transcripts.language
         },
         "background": {
             "mode": config.background.mode.value,
@@ -163,8 +149,8 @@ def get_config_summary(config: PipelineConfig) -> Dict[str, Any]:
 def get_podcast_preset() -> PipelineConfig:
     """Get optimized preset for podcast content"""
     config = get_default_config()
-    config.captions.mode = CaptionMode.SIDECAR
-    config.captions.language = "auto"
+    config.transcripts.language = "auto"
+    config.transcripts.enabled = True
     config.face_tracking.enabled = True
     config.background.mode = BackgroundMode.BLUR
     config.ai.auto_titles = True
@@ -174,8 +160,8 @@ def get_podcast_preset() -> PipelineConfig:
 def get_gaming_preset() -> PipelineConfig:
     """Get optimized preset for gaming content"""
     config = get_default_config()
-    config.captions.mode = CaptionMode.BURN
-    config.captions.style = CaptionStyle.OUTLINE
+    config.transcripts.language = "auto"
+    config.transcripts.enabled = True
     config.face_tracking.enabled = False
     config.background.mode = BackgroundMode.GAMEPLAY
     config.background.game = GameTheme.SUBWAY
@@ -186,9 +172,8 @@ def get_gaming_preset() -> PipelineConfig:
 def get_educational_preset() -> PipelineConfig:
     """Get optimized preset for educational content"""
     config = get_default_config()
-    config.captions.mode = CaptionMode.SIDECAR
-    config.captions.language = "auto"
-    config.captions.word_by_word = True
+    config.transcripts.language = "auto"
+    config.transcripts.enabled = True
     config.face_tracking.enabled = True
     config.background.mode = BackgroundMode.BLUR
     config.ai.auto_titles = True

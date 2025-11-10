@@ -22,20 +22,16 @@ async def process_video(
     background_tasks: BackgroundTasks,
     youtube_url: Optional[str] = Form(None),
     video_file: Optional[UploadFile] = File(None),
-    add_captions: Optional[str] = Form("true"),
-    caption_mode: Optional[str] = Form("burn"),
     user_topics: Optional[str] = Form(None),
     vertical: Optional[str] = Form("true")
 ):
-    """Process video from either YouTube URL or file upload with enhanced options"""
+    """Process video from either YouTube URL or file upload for viral clip generation"""
     
     # Debug logging
     print(f"🔍 Received request:")
     print(f"  YouTube URL: {youtube_url}")
     print(f"  Video file: {video_file.filename if video_file else 'None'}")
     print(f"  File size: {video_file.size if video_file else 'N/A'}")
-    print(f"  Add captions: {add_captions}")
-    print(f"  Caption mode: {caption_mode}")
     print(f"  User topics: {user_topics}")
     print(f"  Vertical output: {vertical}")
     
@@ -46,8 +42,6 @@ async def process_video(
         raise HTTPException(status_code=400, detail="Provide either YouTube URL OR video file, not both")
     
     # Parse parameters
-    add_captions_bool = add_captions.lower() == "true" if add_captions else True
-    caption_mode_str = caption_mode if caption_mode else "burn"
     vertical_bool = vertical.lower() == "true" if vertical else True
     
     # Parse user topics if provided
@@ -67,30 +61,28 @@ async def process_video(
     processing_status[request_id] = {
         "status": "processing",
         "progress": 0,
-        "message": "Starting video processing...",
+        "message": "Starting viral clip generation...",
         "current_step": "initializing",
         "clips": None,
         "error": None,
         "user_topics": user_topics_list,
-        "vertical": vertical_bool,
-        "caption_mode": caption_mode_str
+        "vertical": vertical_bool
     }
     
     # Start background processing
     if youtube_url:
         print(f"🚀 Starting YouTube processing for request: {request_id}")
-        background_tasks.add_task(process_youtube_video, request_id, youtube_url, add_captions_bool, caption_mode_str, user_topics_list, vertical_bool)
+        background_tasks.add_task(process_youtube_video, request_id, youtube_url, user_topics_list, vertical_bool)
     else:
         print(f"🚀 Starting file upload processing for request: {request_id}")
-        background_tasks.add_task(process_uploaded_video, request_id, video_file, add_captions_bool, caption_mode_str, user_topics_list, vertical_bool)
+        background_tasks.add_task(process_uploaded_video, request_id, video_file, user_topics_list, vertical_bool)
     
     return {
         "request_id": request_id,
         "status": "processing",
-        "message": "Video processing started",
+        "message": "Viral clip generation started",
         "user_topics": user_topics_list,
-        "vertical": vertical_bool,
-        "caption_mode": caption_mode_str
+        "vertical": vertical_bool
     }
 
 @router.get("/status/{request_id}")
@@ -120,60 +112,104 @@ async def download_clip(clip_id: str):
     
     # Find the clip in processing status
     clip_path = None
-    for status in processing_status.values():
+    clip_info = None
+    
+    for request_id, status in processing_status.items():
         if status.get("clips"):
             for clip in status["clips"]:
-                if clip["clip_id"] == clip_id:
-                    clip_path = clip["file_path"]
-                    print(f"📁 Found clip in status: {clip}")
+                if clip.get("clip_id") == clip_id:
+                    clip_path = clip.get("file_path")
+                    clip_info = clip
+                    print(f"📁 Found clip in status for request {request_id}: {clip}")
                     break
             if clip_path:
                 break
     
     if not clip_path:
         print(f"❌ Clip {clip_id} not found in processing status")
-        raise HTTPException(status_code=404, detail="Clip not found")
+        print(f"📊 Available request IDs: {list(processing_status.keys())}")
+        # Print all clips for debugging
+        for request_id, status in processing_status.items():
+            if status.get("clips"):
+                print(f"  Request {request_id} has {len(status['clips'])} clips")
+                for clip in status["clips"]:
+                    print(f"    - Clip ID: {clip.get('clip_id')}, Path: {clip.get('file_path')}")
+        raise HTTPException(status_code=404, detail=f"Clip {clip_id} not found in processing status")
     
-    # Debug: print what we found
-    print(f"🔍 Looking for clip {clip_id}")
-    print(f"📁 Found clip path: {clip_path}")
-    print(f"📂 File exists: {os.path.exists(clip_path) if clip_path else 'No path'}")
+    # Make path absolute if it's relative
+    if not os.path.isabs(clip_path):
+        # Try relative to current working directory
+        abs_path = os.path.abspath(clip_path)
+        if os.path.exists(abs_path):
+            clip_path = abs_path
+        else:
+            # Try relative to output directory
+            from app.settings import settings
+            output_dir = os.path.abspath(settings.output_dir)
+            abs_path = os.path.join(output_dir, os.path.basename(clip_path))
+            if os.path.exists(abs_path):
+                clip_path = abs_path
     
+    print(f"📁 Resolved clip path: {clip_path}")
+    print(f"📂 File exists: {os.path.exists(clip_path)}")
+    
+    # If file still doesn't exist, search for it
     if not os.path.exists(clip_path):
-        # Try to find the file in the outputs directory
+        print(f"⚠️ File not found at expected path, searching...")
         from app.settings import settings
-        output_dir = settings.output_dir
-        print(f"Searching in output directory: {output_dir}")
+        output_dir = os.path.abspath(settings.output_dir)
+        print(f"🔍 Searching in output directory: {output_dir}")
         
-        # List all files in output directory
         if os.path.exists(output_dir):
-            files = os.listdir(output_dir)
-            print(f"Files in output directory: {files}")
-            
-            # Look for files that might contain the clip_id
-            for filename in files:
-                if clip_id in filename:
-                    clip_path = os.path.join(output_dir, filename)
-                    print(f"Found matching file: {clip_path}")
-                    break
+            # List all files in output directory
+            try:
+                files = os.listdir(output_dir)
+                print(f"📂 Files in output directory ({len(files)} total): {files[:10]}...")  # Show first 10
+                
+                # Look for files that contain the clip_id
+                for filename in files:
+                    if clip_id in filename and filename.endswith('.mp4'):
+                        found_path = os.path.join(output_dir, filename)
+                        if os.path.exists(found_path):
+                            clip_path = found_path
+                            print(f"✅ Found matching file: {clip_path}")
+                            break
+            except Exception as e:
+                print(f"❌ Error listing output directory: {e}")
         
         if not clip_path or not os.path.exists(clip_path):
-            raise HTTPException(status_code=404, detail="Clip file not found on disk")
+            error_msg = f"Clip file not found on disk. Expected: {clip_path}"
+            print(f"❌ {error_msg}")
+            print(f"📊 Output directory exists: {os.path.exists(output_dir) if 'output_dir' in locals() else 'N/A'}")
+            raise HTTPException(status_code=404, detail=error_msg)
     
-    # Add CORS headers for frontend access
-    response = FileResponse(
-        clip_path,
-        media_type="video/mp4",
-        filename=f"clip_{clip_id}.mp4"
-    )
+    # Verify file is readable
+    try:
+        file_size = os.path.getsize(clip_path)
+        print(f"✅ File found: {clip_path} ({file_size} bytes)")
+    except Exception as e:
+        print(f"❌ Error accessing file: {e}")
+        raise HTTPException(status_code=500, detail=f"Error accessing clip file: {str(e)}")
     
-    # Add CORS headers
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    
-    print(f"✅ Returning file response for {clip_path}")
-    return response
+    # Create file response with proper headers
+    try:
+        response = FileResponse(
+            clip_path,
+            media_type="video/mp4",
+            filename=f"clip_{clip_id}.mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="clip_{clip_id}.mp4"',
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+        
+        print(f"✅ Returning file response for {clip_path}")
+        return response
+    except Exception as e:
+        print(f"❌ Error creating file response: {e}")
+        raise HTTPException(status_code=500, detail=f"Error serving clip file: {str(e)}")
 
 @router.post("/topic-clips")
 async def generate_topic_clips(
@@ -181,14 +217,12 @@ async def generate_topic_clips(
     video_path: Optional[str] = Form(None),
     video_id: Optional[str] = Form(None),
     topics: str = Form(...),
-    add_captions: Optional[str] = Form("true"),
     max_clips: Optional[int] = Form(5),
     vertical: Optional[str] = Form("true")
 ):
     """Generate clips based on specific topics from a video"""
     
     # Parse parameters
-    add_captions_bool = add_captions.lower() == "true" if add_captions else True
     vertical_bool = vertical.lower() == "true" if vertical else True
     
     # Parse topics
@@ -227,7 +261,6 @@ async def generate_topic_clips(
         request_id, 
         video_path or video_id, 
         topics_list, 
-        add_captions_bool, 
         vertical_bool, 
         max_clips
     )
@@ -241,8 +274,66 @@ async def generate_topic_clips(
         "vertical": vertical_bool
     }
 
+@router.get("/clips/{request_id}/rankings")
+async def get_clip_rankings(request_id: str):
+    """Get detailed ranking information for generated clips"""
+    if request_id not in processing_status:
+        raise HTTPException(status_code=404, detail="Request not found")
+    
+    status = processing_status[request_id]
+    if status["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Processing not completed yet")
+    
+    clips = status.get("clips", [])
+    if not clips:
+        raise HTTPException(status_code=404, detail="No clips found")
+    
+    # Extract ranking information
+    rankings = []
+    for clip in clips:
+        if hasattr(clip, 'ranking') and clip.ranking:
+            rankings.append({
+                "clip_id": clip.clip_id,
+                "start_time": clip.start_time,
+                "end_time": clip.end_time,
+                "duration": clip.duration,
+                "viral_score": clip.ranking.viral_score,
+                "engagement_potential": clip.ranking.engagement_potential,
+                "shareability": clip.ranking.shareability,
+                "trending_potential": clip.ranking.trending_potential,
+                "ranking_factors": clip.ranking.ranking_factors,
+                "face_tracking_applied": getattr(clip, 'face_tracking_applied', False),
+                "speaker_centered": getattr(clip, 'speaker_centered', False)
+            })
+    
+    # Calculate summary statistics
+    if rankings:
+        scores = [r["viral_score"] for r in rankings]
+        summary = {
+            "total_clips": len(rankings),
+            "average_score": round(sum(scores) / len(scores), 2),
+            "top_score": max(scores),
+            "lowest_score": min(scores),
+            "score_distribution": {
+                "excellent": len([s for s in scores if s >= 4.5]),
+                "very_good": len([s for s in scores if 4.0 <= s < 4.5]),
+                "good": len([s for s in scores if 3.5 <= s < 4.0]),
+                "average": len([s for s in scores if 3.0 <= s < 3.5]),
+                "below_average": len([s for s in scores if 2.0 <= s < 3.0]),
+                "poor": len([s for s in scores if 1.0 <= s < 2.0]),
+                "very_poor": len([s for s in scores if s < 1.0])
+            }
+        }
+    else:
+        summary = {}
+    
+    return {
+        "request_id": request_id,
+        "rankings": rankings,
+        "summary": summary
+    }
 
-async def process_youtube_video(request_id: str, youtube_url: str, add_captions: str, caption_mode: str, user_topics: Optional[list], vertical: bool):
+async def process_youtube_video(request_id: str, youtube_url: str, user_topics: Optional[list], vertical: bool):
     """Process YouTube video with actual download and processing"""
     try:
         # Update status
@@ -260,7 +351,7 @@ async def process_youtube_video(request_id: str, youtube_url: str, add_captions:
         
         # Process the downloaded video
         processor = VideoProcessor()
-        clips = await processor.process_video(video_path, "youtube", add_captions, user_topics, vertical, caption_mode)
+        clips = await processor.process_video(video_path, "youtube", user_topics, vertical)
         
         print(f"Generated {len(clips)} clips from YouTube video")
         
@@ -340,7 +431,7 @@ async def download_youtube_video(request_id: str, youtube_url: str) -> str:
         print(f"❌ YouTube download failed: {e}")
         raise Exception(f"YouTube download failed: {str(e)}")
 
-async def process_uploaded_video(request_id: str, video_file: UploadFile, add_captions: str, caption_mode: str, user_topics: Optional[list], vertical: bool):
+async def process_uploaded_video(request_id: str, video_file: UploadFile, user_topics: Optional[list], vertical: bool):
     """Process uploaded video file"""
     try:
         # Update status
@@ -378,7 +469,7 @@ async def process_uploaded_video(request_id: str, video_file: UploadFile, add_ca
         
         # Process the video
         processor = VideoProcessor()
-        clips = await processor.process_video(video_path, "file", add_captions, user_topics, vertical, caption_mode)
+        clips = await processor.process_video(video_path, "file", user_topics, vertical)
         
         print(f"Generated {len(clips)} clips")
         
@@ -426,7 +517,7 @@ async def simulate_processing_steps(request_id: str, input_type: str):
         ("transcribing", "Transcribing audio...", 30),
         ("detecting_highlights", "Detecting highlight segments...", 50),
         ("generating_clips", "Generating highlight clips...", 70),
-        ("adding_captions", "Adding captions to clips...", 90),
+        ("generating_transcripts", "Generating transcript files...", 90),
         ("completed", "Processing completed!", 100)
     ]
     
@@ -465,7 +556,6 @@ async def process_topic_clips(
     request_id: str, 
     video_source: str, 
     topics: list, 
-    add_captions: bool, 
     vertical: bool, 
     max_clips: int
 ):
@@ -495,7 +585,6 @@ async def process_topic_clips(
         clips = await processor.process_video(
             video_path, 
             "file", 
-            add_captions, 
             topics, 
             vertical
         )

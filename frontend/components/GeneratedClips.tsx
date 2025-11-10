@@ -28,24 +28,55 @@ const GeneratedClips: React.FC<GeneratedClipsProps> = ({ clips }) => {
     setDownloadingClips(prev => new Set(prev).add(clip.clip_id));
     
     try {
-      // Construct the full download URL
-      const downloadUrl = `http://localhost:8000${clip.download_url}`;
-      console.log(`🌐 Fetching from full URL: ${downloadUrl}`);
+      // Use the download URL directly (Next.js will proxy it via rewrite)
+      // The download_url should be like /api/v1/download/{clip_id}
+      const downloadUrl = clip.download_url.startsWith('http') 
+        ? clip.download_url 
+        : clip.download_url; // Next.js rewrite will handle it
       
-      const response = await fetch(downloadUrl, {
-        method: 'GET',
-        mode: 'cors',
-      });
+      console.log(`🌐 Fetching from URL: ${downloadUrl}`);
+      
+      // Try using Next.js proxy first
+      let response;
+      try {
+        response = await fetch(downloadUrl, {
+          method: 'GET',
+          credentials: 'include',
+        });
+      } catch (proxyError) {
+        // If proxy fails, try direct connection to backend
+        console.warn('Proxy failed, trying direct connection:', proxyError);
+        const directUrl = `http://localhost:8000${clip.download_url}`;
+        response = await fetch(directUrl, {
+          method: 'GET',
+          mode: 'cors',
+        });
+      }
       
       console.log(`📡 Response status: ${response.status}`);
       console.log(`📡 Response headers:`, Object.fromEntries(response.headers.entries()));
       
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        const errorText = await response.text().catch(() => response.statusText);
+        console.error(`❌ HTTP ${response.status}: ${errorText}`);
+        throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+      }
+      
+      // Check if response is actually a video
+      const contentType = response.headers.get('content-type');
+      console.log(`📦 Content-Type: ${contentType}`);
+      
+      if (!contentType || !contentType.includes('video')) {
+        console.warn('⚠️ Response is not a video file, content-type:', contentType);
+        // Still try to download it
       }
       
       const blob = await response.blob();
       console.log(`📦 Blob received: ${blob.size} bytes, type: ${blob.type}`);
+      
+      if (blob.size === 0) {
+        throw new Error('Downloaded file is empty');
+      }
       
       // Create download link
       const url = window.URL.createObjectURL(blob);
@@ -54,19 +85,26 @@ const GeneratedClips: React.FC<GeneratedClipsProps> = ({ clips }) => {
       a.download = `clip_${clip.clip_id}.mp4`;
       document.body.appendChild(a);
       a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
+      
+      // Cleanup after a short delay
+      setTimeout(() => {
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+      }, 100);
       
       console.log(`✅ Download completed successfully for clip: ${clip.clip_id}`);
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ Download failed:', error);
       console.error('❌ Error details:', {
-        message: error.message,
-        stack: error.stack,
+        message: error?.message,
+        stack: error?.stack,
         clip_id: clip.clip_id,
         download_url: clip.download_url
       });
-      alert('Download failed. Please try again.');
+      
+      // Show user-friendly error message
+      const errorMessage = error?.message || 'Download failed. Please try again.';
+      alert(`Download failed: ${errorMessage}\n\nClip ID: ${clip.clip_id}\nURL: ${clip.download_url}`);
     } finally {
       setDownloadingClips(prev => {
         const newSet = new Set(prev);

@@ -14,7 +14,7 @@ from app.config.features import PipelineConfig, get_default_config, load_config_
 from app.prepass import track_faces, detect_speech_segments, detect_scene_changes
 from app.layout.state_machine import LayoutStateMachine
 from app.highlight.scoring import apply_enhanced_scoring
-from app.captions import transcribe_audio, translate_captions
+from app.captions import transcribe_audio
 from app.ai_text import generate_titles_cta
 from app.render import render_blur_background, render_gameplay_background
 from app.services.video_processor import VideoProcessor
@@ -163,11 +163,13 @@ async def process_enhanced_pipeline(
         audio_path = await video_processor._extract_audio(video_path)
         
         # Transcribe with language detection
-        transcription = transcribe_audio(
-            audio_path,
-            language=config.captions.language,
-            translate_to="en" if config.captions.language != "en" else None
-        )
+        transcript_lang = "auto"
+        if hasattr(config, "transcripts"):
+            transcript_lang = config.transcripts.language
+        elif hasattr(config, "captions"):  # Legacy compatibility
+            transcript_lang = getattr(config.captions, "language", "auto")
+        
+        transcription = transcribe_audio(audio_path, language=transcript_lang)
         
         # Extract speech segments
         speech_segments = detect_speech_segments(transcription)
