@@ -50,7 +50,7 @@ pip-delete-this-directory.txt
 ehthumbs.db
 Thumbs.db
 
-# Node.js / Next.js
+# Node.js / Next.js / Vite
 node_modules/
 npm-debug.log*
 yarn-debug.log*
@@ -60,6 +60,9 @@ yarn-error.log*
 out/
 build/
 .vercel
+dist/
+.vite/
+*.local
 
 # Logs
 logs

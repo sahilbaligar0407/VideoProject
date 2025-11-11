@@ -28,25 +28,39 @@ from app.topic.search import topic_windows, topic_windows_embedding
 from app.video.vertical import extract_vertical_clip, get_vertical_dimensions
 from app.highlight.ranking import ClipRanker
 from app.prepass.faces import FaceTracker
+from app.services.auto_captions import AutoCaptionsService, CaptionStyle
 
 class VideoProcessor:
     def __init__(self, 
                  temp_dir: str = "temp",
-                 output_dir: str = "outputs"):
+                 output_dir: str = "outputs",
+                 status_callback: Optional[callable] = None):
         # OpenAI client will be initialized when needed
         self.temp_dir = temp_dir
         self.output_dir = output_dir
+        self.status_callback = status_callback  # Callback to update processing status
         
         # Initialize new components
         self.clip_ranker = ClipRanker()
         self.face_tracker = FaceTracker()
+        self.captions_service = AutoCaptionsService()
+        self.default_caption_style = CaptionStyle()  # Default style: yellow text, black stroke, size 32
+    
+    def _update_status(self, step: str, progress: int, message: str):
+        """Update processing status if callback is provided"""
+        if self.status_callback:
+            try:
+                self.status_callback(step, progress, message)
+            except Exception as e:
+                print(f"⚠️ Status update failed: {e}")
     
     async def process_video(
         self,
         video_path: str,
         input_type: str = "file",
         user_topics: Optional[List[str]] = None,
-        vertical: bool = True
+        vertical: bool = True,
+        caption_style: Optional[CaptionStyle] = None
     ) -> List[GeneratedClip]:
         """Main processing pipeline for viral clip generation"""
         try:
@@ -60,29 +74,41 @@ class VideoProcessor:
             
             # Step 1: Extract audio for transcription
             print("🎵 Step 1: Extracting audio...")
+            self._update_status("extracting_audio", 25, "Extracting audio from video...")
             audio_path = await self._extract_audio(video_path)
             
             # Step 2: Transcribe audio using OpenAI Whisper
             print("🗣️ Step 2: Transcribing audio...")
+            self._update_status("transcribing", 40, "Transcribing audio with Whisper...")
             transcription = await self._transcribe_audio(audio_path)
+            self._update_status("transcribing_complete", 50, "Transcription complete")
             
             # Step 3: Detect highlight segments
             print("✨ Step 3: Detecting highlights...")
+            self._update_status("detecting_highlights", 60, "Detecting highlight segments...")
             highlights = await self._detect_highlights(video_path, transcription, audio_path, user_topics)
+            self._update_status("highlights_detected", 70, f"Found {len(highlights)} highlight segments")
             
             # Step 3.5: Rank clips using the new ranking system
             print("🏆 Step 3.5: Ranking clips for virality...")
+            self._update_status("scoring", 75, "Scoring segments for viral potential...")
             highlights = self.clip_ranker.rank_clips(highlights, transcription, video_path)
+            self._update_status("scoring_complete", 80, "Viral scoring complete")
             
             # Print ranking report
             self.clip_ranker.print_ranking_report(highlights)
             
-            # Step 4: Generate clips from highlights
+            # Step 4: Generate clips from highlights (includes transcript file generation and captioning)
             print("🎬 Step 4: Generating clips...")
-            clips = await self._generate_clips(video_path, highlights, transcription, vertical)
+            self._update_status("generating_clips", 85, "Generating video clips, transcript files, and adding captions...")
+            # Use provided caption style or default
+            caption_style_to_use = caption_style if caption_style else self.default_caption_style
+            clips = await self._generate_clips(video_path, highlights, transcription, vertical, caption_style_to_use)
+            self._update_status("clips_generated", 95, f"Generated {len(clips)} clips with captions")
             
-            # Cleanup temporary files
-            await self._cleanup_temp_files([audio_path])
+            # Cleanup temporary files (audio_path is already cleaned up in _generate_clips)
+            # Additional cleanup for any remaining temp files
+            self._cleanup_temp_files()
             
             print(f"✅ Viral clip generation completed! Generated {len(clips)} clips")
             return clips
@@ -244,6 +270,11 @@ class VideoProcessor:
             
             for i, (start_time, end_time) in enumerate(chunks):
                 print(f"🎤 Transcribing chunk {i+1}/{len(chunks)} ({start_time:.1f}s - {end_time:.1f}s)")
+                
+                # Update progress during transcription (40-50% range, spread across chunks)
+                if self.status_callback:
+                    chunk_progress = 40 + int((i + 1) / len(chunks) * 10)
+                    self._update_status("transcribing", chunk_progress, f"Transcribing chunk {i+1}/{len(chunks)}...")
                 
                 # Extract chunk using FFmpeg
                 chunk_path = os.path.join(self.temp_dir, f"chunk_{i}_{uuid.uuid4()}.wav")
@@ -1026,9 +1057,14 @@ class VideoProcessor:
         return final_highlights
     
     async def _generate_clips(self, video_path: str, highlights: List[HighlightSegment], 
-                             transcription: TranscriptionResult, vertical: bool = True) -> List[GeneratedClip]:
+                             transcription: TranscriptionResult, vertical: bool = True, 
+                             caption_style: Optional[CaptionStyle] = None) -> List[GeneratedClip]:
         """Generate video clips from highlight segments with smart clipping and vertical rendering"""
         clips = []
+        
+        # Use provided caption style or default
+        if caption_style is None:
+            caption_style = self.default_caption_style
         
         print(f"🎬 Generating clips from {len(highlights)} highlights")
         print(f"📁 Output directory: {self.output_dir}")
@@ -1192,15 +1228,45 @@ class VideoProcessor:
                 
                 # Export transcript files (.ass, .srt, .vtt, .json) for the clip
                 base_noext = os.path.splitext(clip_path_abs)[0]
-                await self._export_sidecar_captions(base_noext, transcription, start_time, end_time)
+                transcript_files = await self._export_sidecar_captions(base_noext, transcription, start_time, end_time)
+                # transcript_files is a dict with keys: "vtt", "srt", "ass", "json"
                 
-                # Use the absolute clip path
-                file_path_to_publish = clip_path_abs
+                # Add captions to the clip (only if enabled)
+                if caption_style and caption_style.enabled:
+                    self._update_status("captioning", 90 + int((i + 1) / len(highlights) * 5), f"Adding captions to clip {i+1}/{len(highlights)}...")
+                    captioned_video_path = await self._add_captions_to_clip(clip_path_abs, transcript_files, i+1, caption_style)
+                    
+                    # Use captioned video if available, otherwise use original
+                    file_path_to_publish = captioned_video_path if captioned_video_path else clip_path_abs
+                else:
+                    # Captions disabled, use original clip
+                    file_path_to_publish = clip_path_abs
+                
+                # Generate thumbnail from the captioned clip (extract a frame from middle of clip)
+                thumbnail_path = await self._generate_thumbnail(file_path_to_publish, duration / 2)
                 
                 print(f"✅ Clip {i+1} completed: {os.path.basename(file_path_to_publish)}")
                 print(f"📁 Clip path (absolute): {file_path_to_publish}")
                 print(f"📁 Clip size: {os.path.getsize(file_path_to_publish)} bytes")
                 print(f"📁 Clip ID: {clip_id}")
+                if thumbnail_path:
+                    print(f"🖼️ Thumbnail: {thumbnail_path}")
+                
+                # Update progress during clip generation (including transcript files which are generated above)
+                clip_progress = 85 + int((i + 1) / len(highlights) * 10)
+                self._update_status("generating_clips", clip_progress, f"Generated clip {i+1}/{len(highlights)} with transcript files...")
+                
+                # Extract transcript file paths from transcript_files dict
+                transcript_paths = []
+                if transcript_files:
+                    transcript_paths = [
+                        transcript_files.get("vtt", ""),
+                        transcript_files.get("srt", ""),
+                        transcript_files.get("ass", ""),
+                        transcript_files.get("json", ""),
+                    ]
+                    # Filter out empty strings
+                    transcript_paths = [path for path in transcript_paths if path and os.path.exists(path)]
                 
                 # Create clip object with absolute path
                 clip = GeneratedClip(
@@ -1209,11 +1275,13 @@ class VideoProcessor:
                     end_time=end_time,
                     duration=duration,
                     file_path=file_path_to_publish,  # Store absolute path
+                    thumbnail_path=thumbnail_path,  # Add thumbnail path
                     caption_text=caption_text,
                     download_url=f"/api/v1/download/{clip_id}",
                     ranking=getattr(highlight, 'ranking', None),  # Include ranking information if available
                     face_tracking_applied=face_tracking_success,  # Whether face tracking was used
-                    speaker_centered=face_tracking_success  # Whether speaker was kept centered
+                    speaker_centered=face_tracking_success,  # Whether speaker was kept centered
+                    transcript_paths=transcript_paths if transcript_paths else None  # Add transcript paths
                 )
                 
                 clips.append(clip)
@@ -1233,8 +1301,34 @@ class VideoProcessor:
             except:
                 pass
         
+        # Cleanup all temporary files in temp_dir
+        self._cleanup_temp_files()
+        
         print(f"\n=== Generated {len(clips)} clips successfully ===")
         return clips
+    
+    def _cleanup_temp_files(self):
+        """Clean up all temporary files in the temp directory"""
+        try:
+            if not os.path.exists(self.temp_dir):
+                return
+            
+            cleaned_count = 0
+            # Clean up chunk files and other temp audio files
+            for filename in os.listdir(self.temp_dir):
+                file_path = os.path.join(self.temp_dir, filename)
+                # Only delete .wav files (audio chunks and temp audio)
+                if filename.endswith('.wav') and os.path.isfile(file_path):
+                    try:
+                        os.remove(file_path)
+                        cleaned_count += 1
+                    except Exception as e:
+                        print(f"⚠️ Could not delete temp file {filename}: {e}")
+            
+            if cleaned_count > 0:
+                print(f"🧹 Cleaned up {cleaned_count} temporary file(s) from {self.temp_dir}")
+        except Exception as e:
+            print(f"⚠️ Error during temp file cleanup: {e}")
     
     async def _extract_video_clip(self, video_path: str, output_path: str, start_time: float, duration: float) -> bool:
         """Extract a video clip using FFmpeg with Windows-compatible settings"""
@@ -1815,10 +1909,135 @@ class VideoProcessor:
             import traceback
             traceback.print_exc()
             return {}
+    
+    async def _generate_thumbnail(self, video_path: str, timestamp: float = None) -> Optional[str]:
+        """Generate a thumbnail image from a video clip"""
+        try:
+            if not os.path.exists(video_path):
+                print(f"⚠️ Video file not found for thumbnail: {video_path}")
+                return None
+            
+            # If no timestamp provided, use middle of video
+            if timestamp is None:
+                # Get video duration
+                try:
+                    cmd = ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", video_path]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0:
+                        duration = float(result.stdout.strip())
+                        timestamp = duration / 2  # Use middle of video
+                    else:
+                        timestamp = 1.0  # Default to 1 second
+                except:
+                    timestamp = 1.0
+            
+            # Generate thumbnail path
+            base_path = os.path.splitext(video_path)[0]
+            thumbnail_path = f"{base_path}_thumb.jpg"
+            
+            # Extract frame using ffmpeg
+            # Scale to 1080x1920 (vertical format) and pad if needed
+            cmd = [
+                "ffmpeg",
+                "-ss", str(timestamp),
+                "-i", video_path,
+                "-vframes", "1",
+                "-q:v", "2",  # High quality (2-31 scale, lower = higher quality)
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
+                "-y",
+                thumbnail_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and os.path.exists(thumbnail_path) and os.path.getsize(thumbnail_path) > 0:
+                print(f"✅ Thumbnail generated: {thumbnail_path}")
+                return thumbnail_path
+            else:
+                print(f"⚠️ Thumbnail generation failed for {video_path}")
+                if result.stderr:
+                    print(f"   FFmpeg error: {result.stderr[:200]}")
+                return None
+                
+        except Exception as e:
+            print(f"⚠️ Error generating thumbnail: {e}")
+            return None
 
 
 
 
+
+    async def _add_captions_to_clip(
+        self,
+        clip_path: str,
+        transcript_files: dict,
+        clip_index: int,
+        caption_style: Optional[CaptionStyle] = None
+    ) -> Optional[str]:
+        """
+        Add captions to a clip using the AutoCaptions service
+        
+        Args:
+            clip_path: Path to the clip video
+            transcript_files: Dictionary with transcript file paths (keys: "vtt", "srt", "ass", "json")
+            clip_index: Index of the clip (for logging)
+            caption_style: Caption style to use (defaults to instance default)
+            
+        Returns:
+            Path to captioned video, or None if captioning failed
+        """
+        try:
+            # Prefer ASS format for better styling, fall back to SRT, then VTT
+            transcript_path = None
+            if transcript_files.get("ass") and os.path.exists(transcript_files["ass"]):
+                transcript_path = transcript_files["ass"]
+            elif transcript_files.get("srt") and os.path.exists(transcript_files["srt"]):
+                transcript_path = transcript_files["srt"]
+            elif transcript_files.get("vtt") and os.path.exists(transcript_files["vtt"]):
+                transcript_path = transcript_files["vtt"]
+            
+            if not transcript_path:
+                print(f"⚠️ No transcript file found for clip {clip_index}, skipping captioning")
+                return None
+            
+            # Generate output path for captioned video
+            base_path = os.path.splitext(clip_path)[0]
+            captioned_path = f"{base_path}_captioned.mp4"
+            
+            # Use provided style or default
+            style = caption_style if caption_style else self.default_caption_style
+            
+            print(f"🎬 Adding captions to clip {clip_index}...")
+            print(f"   Input: {clip_path}")
+            print(f"   Transcript: {transcript_path}")
+            print(f"   Output: {captioned_path}")
+            print(f"   Style: {style.regular_words.font_family}, {style.regular_words.font_size}px, {style.regular_words.color}")
+            
+            # Add captions (this is a synchronous call, but we're in an async context)
+            # Run it in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            captioned_path_result = await loop.run_in_executor(
+                None,
+                lambda: self.captions_service.add_captions(
+                    clip_path,
+                    transcript_path,
+                    style,
+                    captioned_path
+                )
+            )
+            
+            if captioned_path_result and os.path.exists(captioned_path_result):
+                print(f"✅ Captions added successfully to clip {clip_index}")
+                return captioned_path_result
+            else:
+                print(f"⚠️ Captioning failed for clip {clip_index}, using original clip")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error adding captions to clip {clip_index}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     # Caption rendering methods removed - now handled by external caption repository
 

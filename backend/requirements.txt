@@ -6,11 +6,16 @@ python-dotenv==1.0.0
 aiofiles==23.2.1
 pydantic==2.5.0
 pydantic-settings==2.1.0
+pydantic[email]==2.5.0
 httpx==0.25.2
 python-ffmpeg==2.0.4
 numpy==1.24.3
 librosa==0.10.1
 scipy==1.11.4
-yt-dlp==2023.12.30
+yt-dlp>=2025.10.22
+pytube==15.0.0
 opencv-python==4.8.1.78
 mediapipe==0.10.7
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+bcrypt==4.1.2

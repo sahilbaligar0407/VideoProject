@@ -19,5 +19,8 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        log_level="info"
+        log_level="info",
+        timeout_keep_alive=600,  # 10 minutes keep-alive timeout for large file uploads
+        limit_concurrency=100,
+        limit_max_requests=1000,
     )

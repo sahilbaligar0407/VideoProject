@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -96,6 +96,58 @@ class ViralScoringRequest(BaseModel):
     """Request model for viral scoring."""
     captions: List[Dict[str, Any]]
     video_duration: float
+
+
+# Authentication Models
+class UserSignup(BaseModel):
+    """Model for user signup request."""
+    email: EmailStr
+    password: str
+    early_access_code: str  # Temporary predevelopment code requirement
+
+
+class UserLogin(BaseModel):
+    """Model for user login request."""
+    email: str  # Changed from EmailStr to allow "admin" as username
+    password: str
+
+
+class UserResponse(BaseModel):
+    """Model for user response."""
+    id: int
+    email: str
+    created_at: str
+
+
+class TokenResponse(BaseModel):
+    """Model for authentication token response."""
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+# Saved Clips Models
+class SaveClipRequest(BaseModel):
+    """Model for saving a clip to library."""
+    clip_id: str
+    file_path: str
+    thumbnail_path: Optional[str] = None
+    transcript_paths: Optional[List[str]] = None
+    clip_metadata: Optional[Dict[str, Any]] = None
+
+
+class SavedClipResponse(BaseModel):
+    """Model for saved clip response."""
+    id: int
+    clip_id: str
+    file_path: str
+    thumbnail_path: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    preview_url: str
+    download_url: str
+    transcript_paths: List[str] = []
+    clip_metadata: Dict[str, Any] = {}
+    created_at: str
 
 
 class ViralScoringResponse(BaseModel):

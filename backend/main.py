@@ -1,9 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import video_processing, viral
-from app.routers import clips  # Add the new clips router
+from app.routers import video_processing, viral, auth
+from app.routers import clips, saved_clips, admin, reports  # Add the new clips router, saved_clips router, admin router, and reports router
 from app.settings import settings
 
+# Configure FastAPI with increased limits for file uploads
 app = FastAPI(
     title="ClipGenius API",
     description="AI-powered video clip generation with viral optimization",
@@ -20,9 +21,13 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(auth.router, prefix="/api/v1")
 app.include_router(video_processing.router, prefix="/api/v1")
 app.include_router(viral.router, prefix="/api/v1")
 app.include_router(clips.router, prefix="/api/v1")  # Add the new clips router
+app.include_router(saved_clips.router, prefix="/api/v1")  # Add saved clips router
+app.include_router(admin.router, prefix="/api/v1")  # Add admin router
+app.include_router(reports.router, prefix="/api/v1")  # Add reports router
 
 @app.get("/")
 async def root():
@@ -30,6 +35,7 @@ async def root():
         "message": "ClipGenius API v2.0",
         "description": "AI-powered video clip generation with enhanced Pipeline v2",
         "endpoints": {
+            "auth": "/api/v1/auth",
             "video_processing": "/api/v1/process-video",
             "viral_engine": "/api/v1/viral",
             "enhanced_clips": "/api/v1/clips/generate",
@@ -43,4 +49,12 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Run with increased timeout and limits for large file uploads
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        timeout_keep_alive=600,  # 10 minutes keep-alive timeout
+        limit_concurrency=100,
+        limit_max_requests=1000,
+    )

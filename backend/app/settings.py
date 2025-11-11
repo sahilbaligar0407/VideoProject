@@ -1,8 +1,19 @@
 import os
 from typing import List
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
+from dotenv import load_dotenv
+
+# Load .env file to make all variables available to os.getenv()
+# This ensures JWT_SECRET_KEY and other variables are accessible
+load_dotenv()
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(
+        extra="ignore",  # Ignore extra fields in .env file (like JWT_SECRET_KEY)
+        env_file=".env",  # Load from .env file
+        env_file_encoding="utf-8"
+    )
     # OpenAI API configuration
     openai_api_key: str = ""
     
@@ -81,9 +92,6 @@ class Settings(BaseSettings):
     # Topic search settings
     topic_search_enabled: bool = True
     topic_embedding_threshold: float = 0.7
-    
-    class Config:
-        env_file = ".env"
 
 # Create settings instance
 settings = Settings()
